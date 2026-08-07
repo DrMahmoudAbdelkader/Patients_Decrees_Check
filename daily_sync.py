@@ -375,6 +375,32 @@ def write_items_review_file(unmatched_items, out_dir):
     logging.info(f"(dry-run) {len(unmatched_items)} unmatched item name(s) -> {path}")
 
 
+def push_needs_review(unmatched_descriptions, unmatched_items):
+    """
+    Upserts every unmatched raw decree description / item name into
+    decree_needs_review (see needs_review_schema.sql) so you can query
+    Supabase any time to spot a new medication that has no mapping yet
+    -- instead of digging through dry-run CSVs or Action artifacts.
+    Runs on every real (non-dry-run) invocation, regardless of whether
+    anything was actually excluded this run.
+    """
+    rows = (
+        [{"kind": "decree_description", "raw_text": t, "last_seen": _now_iso()}
+         for t in sorted(unmatched_descriptions)]
+        + [{"kind": "item_name", "raw_text": t, "last_seen": _now_iso()}
+           for t in sorted(unmatched_items)]
+    )
+    if not rows:
+        logging.info("[needs_review] nothing unmatched this run.")
+        return
+    sb.upsert("decree_needs_review", rows, on_conflict="kind,raw_text")
+    logging.info(f"[needs_review] upserted {len(rows)} unmatched value(s) for review.")
+
+
+def _now_iso():
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # =====================================================================
 # MAIN
 # =====================================================================
@@ -382,15 +408,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="Write CSVs locally instead of writing to Supabase")
     parser.add_argument("--date-offset-days", type=int, default=int(os.environ.get("DATE_OFFSET_DAYS", 25)),
-                         help="Extract the queue for TODAY + this many days (default 25)")
+                         help="Extract the queue for TODAY + this many days (default 25). "
+                              "Ignored if --date is given.")
+    parser.add_argument("--date", default=None,
+                         help="Extract the queue for this EXACT date instead of an offset from today. "
+                              "Format: YYYY-MM-DD. Use this to re-pull a specific past or future day "
+                              "on demand, e.g. --date 2026-08-15")
     parser.add_argument("--patients-file", default=None,
                          help="Skip step 1 and use this newline-delimited national-ID file instead")
     parser.add_argument("--out-dir", default="./dry_run_output")
     args = parser.parse_args()
 
-    target_date = datetime.now() + timedelta(days=args.date_offset_days)
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d")
+    else:
+        target_date = datetime.now() + timedelta(days=args.date_offset_days)
     target_ddmmyyyy = target_date.strftime("%d-%m-%Y")
     target_iso = target_date.strftime("%Y-%m-%d")
+    logging.info(f"Target date: {target_iso}"
+                 + (" (explicit --date)" if args.date else f" (today + {args.date_offset_days} days)"))
 
     # ---- Step 1: queue ----
     if args.patients_file:
@@ -438,6 +474,7 @@ def main():
         sb.upsert("decree_issued_decrees", decree_rows, on_conflict="decree_number")
         sb.upsert("decree_dispensed_items", dispensed_rows,
                   on_conflict="id_number,decree_number,item_name,dispensing_date,quantity,price")
+        push_needs_review(unmatched_descriptions, unmatched_items)
         logging.info("Sync complete.")
 
 
