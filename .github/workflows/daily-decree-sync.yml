@@ -13,9 +13,14 @@ on:
         default: false
 
       date_offset_days:
-        description: 'Extract queue for TODAY + N days'
+        description: 'Extract queue for TODAY + N days (ignored if "Exact date" is filled in)'
         type: string
         default: '25'
+
+      exact_date:
+        description: 'Re-pull one specific day instead (YYYY-MM-DD) — leave blank for normal runs'
+        type: string
+        default: ''
 
 jobs:
   sync:
@@ -43,8 +48,14 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
+          EXACT_DATE="${{ github.event.inputs.exact_date }}"
           OFFSET="${{ github.event.inputs.date_offset_days || '25' }}"
-          ARGS="--date-offset-days $OFFSET"
+
+          if [ -n "$EXACT_DATE" ]; then
+            ARGS="--date $EXACT_DATE"
+          else
+            ARGS="--date-offset-days $OFFSET"
+          fi
 
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
