@@ -1,0 +1,52 @@
+name: Daily Decree Renewal Sync
+
+on:
+  schedule:
+    # 03:00 UTC = 05:00 Cairo time (adjust to when the HMIS/SMC sites are
+    # least busy). Cron is always UTC regardless of daylight saving.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (write CSVs as workflow artifacts, do not touch Supabase)'
+        type: boolean
+        default: false
+      date_offset_days:
+        description: 'Extract queue for TODAY + N days'
+        type: string
+        default: '25'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 openpyxl pandas
+
+      - name: Run daily sync
+        env:
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          cd pipeline
+          ARGS="--date-offset-days ${{ github.event.inputs.date_offset_days || '25' }}"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python daily_sync.py $ARGS
+
+      - name: Upload dry-run output
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-output
+          path: pipeline/dry_run_output/
