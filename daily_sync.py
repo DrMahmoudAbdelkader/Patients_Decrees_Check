@@ -3,7 +3,7 @@ daily_sync.py — Decree Renewal daily pipeline entry point.
 
 Runs, once a day (via GitHub Actions):
   1. Download the "Clinic List Detail - by Status" queue report for
-     TODAY + DATE_OFFSET_DAYS (default 25) from the HMIS webreport,
+     TODAY + DATE_OFFSET_DAYS (default 15) from the HMIS webreport,
      parse it into clean rows, keep only the outpatient clinics that
      matter for this workflow.
   2. Log in to SMC, pull every issued decree (+ death status) for each
@@ -11,21 +11,23 @@ Runs, once a day (via GitHub Actions):
   3. Pull every dispensed/billed item for every decree found in step 2.
   4. Upsert all three result sets into Supabase.
 
-!! READ BEFORE POINTING THIS AT PRODUCTION !!
-Both previously-open items are now resolved:
-  (a) decree-list column mapping — cols[5]/cols[7]/cols[8] confirmed as
-      Decree_Total_Value / Decree_Value_Left / Decree_Status, named
-      directly in extract_row_data() below.
-  (b) raw-text -> unique-name normalization — now an exact-match lookup
-      against your own two mapping sheets (decree_unique_name_map.xlsx,
-      item_unique_name_map.xlsx), see decree_name_map.py. Anything with
-      no match in those sheets (#N/A) is EXCLUDED from this pipeline —
-      both for decrees and for dispensed/billed items — since that's
-      ~99% non-medication services (scans, IR, labs, etc.) this workflow
-      doesn't track. Run --dry-run and check
-      dry_run_output/raw_decree_descriptions_needing_review.csv and
-      raw_item_names_needing_review.csv for anything that should actually
-      be in your mapping sheets but is falling through.
+!! REDESIGN NOTE (mapping tables now dynamic, Supabase-backed) !!
+Raw-text -> unique-name normalization is no longer an Excel VLOOKUP.
+decree_name_map.py now loads decree_name_map / item_name_map straight
+from Supabase, and a raw value can be in one of three states:
+    mapped   -> normal row, decree_unique_name / unique_item_name set
+    pending  -> row is KEPT (not dropped) with unique_name = NULL, and
+                the raw text is upserted into the map table so it shows
+                up in needs-review.js. The instant someone maps it
+                in-app, needs-review.js promotes this exact row (and any
+                sibling rows with the same raw text) directly -- no
+                waiting for tomorrow's run.
+    ignored  -> row is excluded entirely, same as the old #N/A behavior,
+                and its raw text is never re-touched.
+This replaced the old rule where an unmatched row was reduced to just
+its description string and everything else about it (value, date,
+status...) was thrown away -- see the redesign brief for why.
+
 Run with --dry-run first and check the CSVs it writes to ./dry_run_output/
 against a handful of patients you already know the answer for, before
 ever running this for real (no --dry-run) against the Supabase tables.
@@ -33,7 +35,7 @@ ever running this for real (no --dry-run) against the Supabase tables.
 Usage:
     python daily_sync.py --dry-run
     python daily_sync.py                      # writes to Supabase
-    python daily_sync.py --date-offset-days 25 --patients-file ids.txt
+    python daily_sync.py --date-offset-days 15 --patients-file ids.txt
 """
 
 import os
@@ -51,7 +53,7 @@ import queue_extractor as qx
 import queue_parser as qp
 import smc_session as smc
 import supabase_client as sb
-from decree_name_map import normalize_decree_name, normalize_item_name
+from decree_name_map import normalize_decree_name, normalize_item_name, get_decree_map, get_item_map
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -175,18 +177,21 @@ def extract_row_data(row, patient_id: str) -> dict:
 
 def build_decree_record(row_data: dict, details: dict, death_status: str, death_date):
     """
-    Shapes one decree_issued_decrees row — or returns None if the raw
-    Decree_Description has no match in decree_name_map.DECREE_NAME_MAP
-    (an #N/A in your mapping sheet). Per your instruction, unmatched
-    decrees are non-medication services (scans, interventional radiology,
-    labs, etc.) and are excluded from this workflow entirely, so the
-    caller must skip appending the row (and skip fetching its dispensed
-    items) when this returns None.
+    Shapes one decree_issued_decrees row. Per the redesign, this NEVER
+    returns None for an unmatched description anymore -- only when the
+    raw description is confirmed 'ignored' in decree_name_map (a real
+    non-medication service you've already told the app to skip). An
+    unmatched-but-undecided ('pending') description still gets a full
+    row, with decree_unique_name = NULL, so nothing about it is lost.
+
+    Returns (record_or_None, action) where action is
+    'mapped' | 'pending' | 'ignored', so the caller can track which raw
+    descriptions need to be pushed to decree_name_map as pending.
     """
     raw_description = (details or {}).get('Decree_Text_Col10') or ''
-    unique_name = normalize_decree_name(raw_description)
-    if unique_name is None:
-        return None
+    unique_name, action = normalize_decree_name(raw_description)
+    if action == 'ignored':
+        return None, action
 
     return {
         "patient_id": row_data["Patient_ID"],
@@ -197,11 +202,11 @@ def build_decree_record(row_data: dict, details: dict, death_status: str, death_
         "decree_number": row_data["Decree_Number"],
         "decree_due_period_days": parse_due_period_days((details or {}).get('Decree_Text_Col6')),
         "decree_description": raw_description or None,
-        "decree_unique_name": unique_name,
+        "decree_unique_name": unique_name,  # None while 'pending'
         "decree_expired_status": (details or {}).get('Decree_Expired_Status'),
         "patient_death_status": death_status,
         "patient_death_date": parse_smc_date(death_date) if death_date and death_date != "Date not specified" else None,
-    }
+    }, action
 
 
 def _to_number(text):
@@ -216,19 +221,19 @@ def _to_number(text):
 
 def fetch_decrees_for_patients(session: smc.SMCSession, patient_ids: list) -> tuple:
     """
-    Returns (decree_rows, decree_numbers_by_patient, unmatched_descriptions).
+    Returns (decree_rows, decree_numbers_by_patient, pending_descriptions).
 
-    Decrees whose raw description has no match in the Decree_Unique_Name
-    map (build_decree_record() returns None) are excluded here — neither
-    added to decree_rows nor to decree_numbers_by_patient, so step 3
-    never bothers fetching dispensed items for a decree we're not
-    tracking. unmatched_descriptions collects exactly which raw
-    descriptions were excluded, for the dry-run review CSV.
+    decree_numbers_by_patient includes decree numbers for BOTH 'mapped'
+    and 'pending' rows now (only 'ignored' ones are skipped) -- a
+    pending decree's dispensed items still get fetched below, so if/when
+    it gets mapped in-app there's already dispensing history sitting
+    behind it instead of a second wait for tomorrow's dispensed-items
+    pull too.
     """
     decree_rows = []
     decree_numbers_by_patient = {}
-    unmatched_descriptions = set()
-    excluded_count = 0
+    pending_descriptions = set()
+    ignored_count = 0
 
     for idx, pid in enumerate(patient_ids, 1):
         logging.info(f"[decrees] patient {idx}/{len(patient_ids)}: {pid}")
@@ -246,35 +251,36 @@ def fetch_decrees_for_patients(session: smc.SMCSession, patient_ids: list) -> tu
             if not row_data or not row_data.get('Decree_Number'):
                 continue
             details = session.get_decree_details(row_data['Decree_Number'])
-            record = build_decree_record(row_data, details, death_status, death_date)
+            record, action = build_decree_record(row_data, details, death_status, death_date)
             time.sleep(DELAY_BETWEEN_DECREES)
 
-            if record is None:
-                excluded_count += 1
+            if action == 'ignored':
+                ignored_count += 1
+                continue
+
+            if action == 'pending':
                 raw_description = ((details or {}).get('Decree_Text_Col10') or '').strip()
                 if raw_description:
-                    unmatched_descriptions.add(raw_description)
-                continue
+                    pending_descriptions.add(raw_description)
 
             decree_rows.append(record)
             numbers.append(row_data['Decree_Number'])
         decree_numbers_by_patient[pid] = numbers
         time.sleep(DELAY_BETWEEN_PATIENTS)
 
-    if excluded_count:
-        logging.info(
-            f"[decrees] excluded {excluded_count} decree(s) with no "
-            f"Decree_Unique_Name match (non-medication services)."
-        )
+    if ignored_count:
+        logging.info(f"[decrees] excluded {ignored_count} decree(s) marked 'ignored' in decree_name_map.")
+    if pending_descriptions:
+        logging.info(f"[decrees] {len(pending_descriptions)} distinct pending (unmapped) description(s) this run.")
 
-    return decree_rows, decree_numbers_by_patient, unmatched_descriptions
+    return decree_rows, decree_numbers_by_patient, pending_descriptions
 
 
 # =====================================================================
 # STEP 3 — Dispensed / billed items
 # =====================================================================
 def fetch_dispensed_items(session: smc.SMCSession, decree_numbers_by_patient: dict) -> tuple:
-    """Returns (dispensed_rows, unmatched_item_names) — see shaping block below."""
+    """Returns (dispensed_rows, pending_items) — see shaping block below."""
     dispensed_rows = []
     total_decrees = sum(len(v) for v in decree_numbers_by_patient.values())
     done = 0
@@ -298,26 +304,26 @@ def fetch_dispensed_items(session: smc.SMCSession, decree_numbers_by_patient: di
 
             time.sleep(DELAY_BETWEEN_DECREES)
 
-    # shape for decree_dispensed_items table — items with no match in the
-    # Unique_Items_Names map (#N/A) are excluded, same rule as decrees:
-    # these are the ~99% non-medication service lines (scans, IR,
-    # labs, etc.) this workflow doesn't track.
+    # shape for decree_dispensed_items table. Per the redesign, a row
+    # whose Item_Name comes back 'ignored' is excluded (same as before);
+    # 'pending' rows are KEPT with unique_item_name = NULL.
     shaped = []
-    unmatched_items = set()
-    excluded_count = 0
+    pending_items = set()
+    ignored_count = 0
     for item in dispensed_rows:
         raw_item_name = (item.get("Item_Name") or "").strip()
-        unique_item_name = normalize_item_name(raw_item_name)
-        if unique_item_name is None:
-            excluded_count += 1
-            if raw_item_name:
-                unmatched_items.add(raw_item_name)
+        unique_item_name, action = normalize_item_name(raw_item_name)
+        if action == 'ignored':
+            ignored_count += 1
             continue
+        if action == 'pending' and raw_item_name:
+            pending_items.add(raw_item_name)
+
         shaped.append({
             "id_number": item["ID_Number"],
             "decree_number": item["Decree_Number"],
             "item_name": item.get("Item_Name"),
-            "unique_item_name": unique_item_name,
+            "unique_item_name": unique_item_name,  # None while 'pending'
             "quantity": _to_number(item.get("Quantity")),
             "unit": item.get("Unit"),
             "price": _to_number(item.get("Price")),
@@ -325,14 +331,13 @@ def fetch_dispensed_items(session: smc.SMCSession, decree_numbers_by_patient: di
             "notes": item.get("Notes"),
         })
 
-    if excluded_count:
-        logging.info(
-            f"[dispensed] excluded {excluded_count} item row(s) with no "
-            f"Unique_Items_Names match (non-medication services)."
-        )
+    if ignored_count:
+        logging.info(f"[dispensed] excluded {ignored_count} item row(s) marked 'ignored' in item_name_map.")
+    if pending_items:
+        logging.info(f"[dispensed] {len(pending_items)} distinct pending (unmapped) item name(s) this run.")
 
     kept = [r for r in shaped if r["dispensing_date"]]  # dispensing_date is NOT NULL in the schema
-    return kept, unmatched_items
+    return kept, pending_items
 
 
 # =====================================================================
@@ -349,56 +354,24 @@ def write_csv(path, rows):
     logging.info(f"(dry-run) wrote {len(rows)} row(s) -> {path}")
 
 
-def write_review_file(unmatched_descriptions, out_dir):
-    """Raw Decree_Description values with no match in decree_unique_name_map.xlsx
-    (#N/A) — every decree using one of these was excluded from this run.
-    Add the ones that ARE medications to your mapping sheet; leave the rest
-    (scans/IR/labs/etc.) out on purpose."""
-    path = os.path.join(out_dir, "raw_decree_descriptions_needing_review.csv")
+def write_review_file(pending_descriptions, out_dir):
+    path = os.path.join(out_dir, "raw_decree_descriptions_pending.csv")
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["raw_decree_description"])
-        for u in sorted(unmatched_descriptions):
+        for u in sorted(pending_descriptions):
             writer.writerow([u])
-    logging.info(f"(dry-run) {len(unmatched_descriptions)} unmatched decree description(s) -> {path}")
+    logging.info(f"(dry-run) {len(pending_descriptions)} pending decree description(s) -> {path}")
 
 
-def write_items_review_file(unmatched_items, out_dir):
-    """Raw Item_Name values with no match in item_unique_name_map.xlsx (#N/A)
-    — every dispensed/billed line using one of these was excluded."""
-    path = os.path.join(out_dir, "raw_item_names_needing_review.csv")
+def write_items_review_file(pending_items, out_dir):
+    path = os.path.join(out_dir, "raw_item_names_pending.csv")
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["raw_item_name"])
-        for u in sorted(unmatched_items):
+        for u in sorted(pending_items):
             writer.writerow([u])
-    logging.info(f"(dry-run) {len(unmatched_items)} unmatched item name(s) -> {path}")
-
-
-def push_needs_review(unmatched_descriptions, unmatched_items):
-    """
-    Upserts every unmatched raw decree description / item name into
-    decree_needs_review (see needs_review_schema.sql) so you can query
-    Supabase any time to spot a new medication that has no mapping yet
-    -- instead of digging through dry-run CSVs or Action artifacts.
-    Runs on every real (non-dry-run) invocation, regardless of whether
-    anything was actually excluded this run.
-    """
-    rows = (
-        [{"kind": "decree_description", "raw_text": t, "last_seen": _now_iso()}
-         for t in sorted(unmatched_descriptions)]
-        + [{"kind": "item_name", "raw_text": t, "last_seen": _now_iso()}
-           for t in sorted(unmatched_items)]
-    )
-    if not rows:
-        logging.info("[needs_review] nothing unmatched this run.")
-        return
-    sb.upsert("decree_needs_review", rows, on_conflict="kind,raw_text")
-    logging.info(f"[needs_review] upserted {len(rows)} unmatched value(s) for review.")
-
-
-def _now_iso():
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    logging.info(f"(dry-run) {len(pending_items)} pending item name(s) -> {path}")
 
 
 # =====================================================================
@@ -407,8 +380,8 @@ def _now_iso():
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="Write CSVs locally instead of writing to Supabase")
-    parser.add_argument("--date-offset-days", type=int, default=int(os.environ.get("DATE_OFFSET_DAYS", 25)),
-                         help="Extract the queue for TODAY + this many days (default 25). "
+    parser.add_argument("--date-offset-days", type=int, default=int(os.environ.get("DATE_OFFSET_DAYS", 15)),
+                         help="Extract the queue for TODAY + this many days (default 15). "
                               "Ignored if --date is given.")
     parser.add_argument("--date", default=None,
                          help="Extract the queue for this EXACT date instead of an offset from today. "
@@ -450,12 +423,12 @@ def main():
         logging.error("SMC login failed — aborting.")
         sys.exit(1)
 
-    decree_rows, decree_numbers_by_patient, unmatched_descriptions = fetch_decrees_for_patients(session, patient_ids)
-    logging.info(f"{len(decree_rows)} decree row(s) fetched (medication decrees only).")
+    decree_rows, decree_numbers_by_patient, pending_descriptions = fetch_decrees_for_patients(session, patient_ids)
+    logging.info(f"{len(decree_rows)} decree row(s) fetched (medication decrees, mapped + pending).")
 
     # ---- Step 3: dispensed items ----
-    dispensed_rows, unmatched_items = fetch_dispensed_items(session, decree_numbers_by_patient)
-    logging.info(f"{len(dispensed_rows)} dispensed/billed item row(s) fetched (medication items only).")
+    dispensed_rows, pending_items = fetch_dispensed_items(session, decree_numbers_by_patient)
+    logging.info(f"{len(dispensed_rows)} dispensed/billed item row(s) fetched (medication items, mapped + pending).")
 
     # ---- Step 4: write ----
     if args.dry_run:
@@ -463,8 +436,8 @@ def main():
         write_csv(os.path.join(args.out_dir, "queue_data.csv"), queue_rows)
         write_csv(os.path.join(args.out_dir, "issued_decrees.csv"), decree_rows)
         write_csv(os.path.join(args.out_dir, "dispensed_items.csv"), dispensed_rows)
-        write_review_file(unmatched_descriptions, args.out_dir)
-        write_items_review_file(unmatched_items, args.out_dir)
+        write_review_file(pending_descriptions, args.out_dir)
+        write_items_review_file(pending_items, args.out_dir)
         with open(os.path.join(args.out_dir, "patient_ids.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(patient_ids))
         logging.info(f"DRY RUN complete — review the CSVs in {args.out_dir} before running for real.")
@@ -474,7 +447,12 @@ def main():
         sb.upsert("decree_issued_decrees", decree_rows, on_conflict="decree_number")
         sb.upsert("decree_dispensed_items", dispensed_rows,
                   on_conflict="id_number,decree_number,item_name,dispensing_date,quantity,price")
-        push_needs_review(unmatched_descriptions, unmatched_items)
+        # Keep decree_name_map / item_name_map in sync with what we saw
+        # this run -- inserts brand-new pending raw text, bumps
+        # times_seen/last_seen on ones already pending. Never touches a
+        # row that's already 'mapped' or 'ignored' (see the DB trigger).
+        get_decree_map().push_pending(pending_descriptions)
+        get_item_map().push_pending(pending_items)
         logging.info("Sync complete.")
 
 
