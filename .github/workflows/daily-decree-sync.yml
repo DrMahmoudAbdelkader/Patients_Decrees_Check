@@ -15,7 +15,7 @@ on:
       date_offset_days:
         description: 'Extract queue for TODAY + N days (ignored if "Exact date" is filled in)'
         type: string
-        default: '25'
+        default: '15'
 
       exact_date:
         description: 'Re-pull one specific day instead (YYYY-MM-DD) — leave blank for normal runs'
@@ -25,7 +25,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -41,7 +41,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 openpyxl pandas
 
-      - name: Run daily sync
+      # -----------------------------------------------------------------
+      # Existing job: queue -> decrees -> dispensed items, TODAY + offset
+      # (offset default now 15, was 25)
+      # -----------------------------------------------------------------
+      - name: Run daily sync (queue + decrees + dispensed items)
         env:
           SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
@@ -49,7 +53,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           EXACT_DATE="${{ github.event.inputs.exact_date }}"
-          OFFSET="${{ github.event.inputs.date_offset_days || '25' }}"
+          OFFSET="${{ github.event.inputs.date_offset_days || '15' }}"
 
           if [ -n "$EXACT_DATE" ]; then
             ARGS="--date $EXACT_DATE"
@@ -64,9 +68,69 @@ jobs:
           echo "Running: python daily_sync.py $ARGS"
           python daily_sync.py $ARGS
 
+      # -----------------------------------------------------------------
+      # New job E: freshly-issued decrees, for TODAY (not offset).
+      # Needs the second SMC account for the hospital-wide list step.
+      # -----------------------------------------------------------------
+      - name: Run hospital decrees sync (today's freshly-issued decrees)
+        env:
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="--dry-run"
+          fi
+          echo "Running: python hospital_decrees_sync.py $ARGS"
+          python hospital_decrees_sync.py $ARGS
+
+      - name: Promote/normalize hospital decrees into decree_issued_decrees
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          echo "Running: python promote_hospital_decrees.py"
+          python promote_hospital_decrees.py
+
+      # -----------------------------------------------------------------
+      # New job F: decree requests placed for patients, for TODAY.
+      # Same second SMC account, single session.
+      # -----------------------------------------------------------------
+      - name: Run request status sync (today's placed requests)
+        env:
+          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="--dry-run"
+          fi
+          echo "Running: python request_status_sync.py $ARGS"
+          python request_status_sync.py $ARGS
+
+      - name: Normalize request descriptions against request_name_map
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          echo "Running: python promote_request_status.py"
+          python promote_request_status.py
+
       - name: Upload dry-run output
         if: ${{ github.event.inputs.dry_run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: dry-run-output
+          # All three scripts default to ./dry_run_output and write
+          # differently-named CSVs there (queue_data.csv, issued_decrees.csv,
+          # hospital_decrees.csv, request_status.csv, ...) so one shared
+          # folder is fine — no filename collisions.
           path: dry_run_output/
