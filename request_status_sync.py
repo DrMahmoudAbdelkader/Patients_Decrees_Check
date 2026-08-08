@@ -87,6 +87,31 @@ def _smc_datetime_str(date_iso: str) -> str:
     return f"{d.month}/{d.day}/{d.year} 12:00:00 AM"
 
 
+def _clean_id(value) -> str:
+    """
+    !! BUG FIX (confirmed via manual Charles capture) !!
+    SendRequestStatusJson's ASP.NET serializer emits numeric ID columns
+    (REQUESTID, CITIZENSSN) as JSON floats -- e.g. 67227949.0 instead of
+    67227949. json.loads() then hands back a Python float, and the old
+    `str(rec.get('REQUESTID') or '')` turned that into the literal string
+    '67227949.0'. Every /smc/Requests/Details/{request_number} lookup
+    then 404'd, because the site's own Details page only accepts the
+    plain integer (confirmed: .../Details/67227949 -> 200,
+    .../Details/67227949.0 -> 404, in the same captured session).
+    This strips a trailing '.0' off any whole-number float/string before
+    it's used anywhere -- in the URL, in the output rows, or as a dict
+    key -- so it never leaks downstream again.
+    """
+    if value is None:
+        return ''
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else str(value)
+    text = str(value).strip()
+    if text.endswith('.0') and text[:-2].lstrip('-').isdigit():
+        return text[:-2]
+    return text
+
+
 def _parse_send_request_status_json(raw):
     """Unwraps the response body regardless of whether the server sent a
     real JSON array or a JSON-encoded string containing one (the page's
@@ -130,11 +155,11 @@ def fetch_request_status_list(session: smc.SMCSession, date_iso: str) -> list:
 
     rows_out = []
     for rec in records:
-        request_number = str(rec.get('REQUESTID') or '').strip()
+        request_number = _clean_id(rec.get('REQUESTID'))
         if not request_number:
             continue
         patient_name = (rec.get('CITIZENFULLNAMEARABIC') or '').strip() or None
-        patient_id = str(rec.get('CITIZENSSN') or '').strip() or None
+        patient_id = _clean_id(rec.get('CITIZENSSN')) or None
         request_status = (rec.get('STATUSARABICNAME') or '').strip() or None
         rows_out.append({
             'request_number': request_number,
