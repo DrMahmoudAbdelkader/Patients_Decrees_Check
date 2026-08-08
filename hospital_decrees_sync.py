@@ -234,7 +234,10 @@ def fetch_national_id_for_decree(session: smc.SMCSession, decree_number: str, da
         'page': '1',
     }
     try:
-        resp = session.session.post(url, data=payload, timeout=30)
+        resp = session.session.post(
+            url, data=payload, timeout=30,
+            headers={'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+        )
     except Exception as e:
         logging.error(f"DecreesSearch failed for decree {decree_number}: {e}")
         return None
