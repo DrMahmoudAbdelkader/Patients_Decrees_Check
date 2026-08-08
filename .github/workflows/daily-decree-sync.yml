@@ -2,8 +2,11 @@ name: Daily Decree Renewal Sync
 
 on:
   schedule:
-    # 03:00 UTC = 05:00 Cairo time
-    - cron: '0 3 * * *'
+    # 19:00 UTC = 21:00 Cairo time (Cairo is fixed UTC+2, no DST since 2016).
+    # Chosen so hospital_decrees_sync.py / request_status_sync.py run for
+    # "today" AFTER working hours have ended, with a ~3h buffer before
+    # midnight in case the run gets queued/delayed.
+    - cron: '0 19 * * *'
 
   workflow_dispatch:
     inputs:
@@ -19,6 +22,16 @@ on:
 
       exact_date:
         description: 'Re-pull one specific day instead (YYYY-MM-DD) — leave blank for normal runs'
+        type: string
+        default: ''
+
+      backfill_start_date:
+        description: 'ONE-TIME BACKFILL: first day (YYYY-MM-DD) to backfill hospital decrees + requests for. Leave blank for normal runs. When set, this run does ONLY the backfill loop below and skips the normal steps.'
+        type: string
+        default: ''
+
+      backfill_end_date:
+        description: 'ONE-TIME BACKFILL: last day (YYYY-MM-DD), inclusive. Required if backfill_start_date is set.'
         type: string
         default: ''
 
@@ -43,9 +56,11 @@ jobs:
 
       # -----------------------------------------------------------------
       # Existing job: queue -> decrees -> dispensed items, TODAY + offset
-      # (offset default now 15, was 25)
+      # (offset default now 15, was 25). Skipped entirely during a backfill
+      # run -- backfill only concerns hospital decrees + requests.
       # -----------------------------------------------------------------
       - name: Run daily sync (queue + decrees + dispensed items)
+        if: ${{ github.event.inputs.backfill_start_date == '' }}
         env:
           SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
@@ -71,8 +86,10 @@ jobs:
       # -----------------------------------------------------------------
       # New job E: freshly-issued decrees, for TODAY (not offset).
       # Needs the second SMC account for the hospital-wide list step.
+      # Skipped during a backfill run (see backfill step below instead).
       # -----------------------------------------------------------------
       - name: Run hospital decrees sync (today's freshly-issued decrees)
+        if: ${{ github.event.inputs.backfill_start_date == '' }}
         env:
           SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
@@ -89,7 +106,7 @@ jobs:
           python hospital_decrees_sync.py $ARGS
 
       - name: Promote/normalize hospital decrees into decree_issued_decrees
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+        if: ${{ github.event.inputs.backfill_start_date == '' && github.event.inputs.dry_run != 'true' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -100,8 +117,10 @@ jobs:
       # -----------------------------------------------------------------
       # New job F: decree requests placed for patients, for TODAY.
       # Same second SMC account, single session.
+      # Skipped during a backfill run (see backfill step below instead).
       # -----------------------------------------------------------------
       - name: Run request status sync (today's placed requests)
+        if: ${{ github.event.inputs.backfill_start_date == '' }}
         env:
           SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
           SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
@@ -116,7 +135,7 @@ jobs:
           python request_status_sync.py $ARGS
 
       - name: Normalize request descriptions against request_name_map
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+        if: ${{ github.event.inputs.backfill_start_date == '' && github.event.inputs.dry_run != 'true' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -124,8 +143,63 @@ jobs:
           echo "Running: python promote_request_status.py"
           python promote_request_status.py
 
+      # -----------------------------------------------------------------
+      # ONE-TIME BACKFILL MODE
+      # Only runs when backfill_start_date is set via workflow_dispatch.
+      # Loops day-by-day over [backfill_start_date, backfill_end_date],
+      # running hospital_decrees_sync.py and request_status_sync.py for
+      # each real calendar day (both scripts already accept --date), then
+      # runs the two promote scripts ONCE at the end over the whole batch.
+      # Always writes to Supabase for real -- dry_run is ignored here on
+      # purpose, since a dry-run backfill defeats the point; if you want
+      # to sanity-check first, backfill a single day (start == end) and
+      # check the tables before doing the full range.
+      # -----------------------------------------------------------------
+      - name: Backfill hospital decrees + requests for a date range
+        if: ${{ github.event.inputs.backfill_start_date != '' }}
+        env:
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          START="${{ github.event.inputs.backfill_start_date }}"
+          END="${{ github.event.inputs.backfill_end_date }}"
+
+          if [ -z "$END" ]; then
+            echo "backfill_end_date is required when backfill_start_date is set." >&2
+            exit 1
+          fi
+
+          d="$START"
+          end_epoch=$(date -d "$END" +%s)
+
+          while [ "$(date -d "$d" +%s)" -le "$end_epoch" ]; do
+            echo "=================================================="
+            echo "Backfilling $d"
+            echo "=================================================="
+            echo "Running: python hospital_decrees_sync.py --date $d"
+            python hospital_decrees_sync.py --date "$d"
+
+            echo "Running: python request_status_sync.py --date $d"
+            python request_status_sync.py --date "$d"
+
+            d=$(date -d "$d + 1 day" +%Y-%m-%d)
+          done
+
+          echo "=================================================="
+          echo "Promoting the full backfilled batch"
+          echo "=================================================="
+          echo "Running: python promote_hospital_decrees.py"
+          python promote_hospital_decrees.py
+
+          echo "Running: python promote_request_status.py"
+          python promote_request_status.py
+
       - name: Upload dry-run output
-        if: ${{ github.event.inputs.dry_run == 'true' }}
+        if: ${{ github.event.inputs.backfill_start_date == '' && github.event.inputs.dry_run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: dry-run-output
