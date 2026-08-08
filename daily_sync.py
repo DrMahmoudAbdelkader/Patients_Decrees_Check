@@ -443,9 +443,18 @@ def main():
         logging.info(f"DRY RUN complete — review the CSVs in {args.out_dir} before running for real.")
     else:
         if queue_rows:
-            sb.upsert("decree_queue_data", queue_rows, on_conflict="national_id,appointment_number")
-        sb.upsert("decree_issued_decrees", decree_rows, on_conflict="decree_number")
-        sb.upsert("decree_dispensed_items", dispensed_rows,
+            sb.upsert("decree_queue_data",
+                      _dedupe_for_upsert(queue_rows, ("national_id", "appointment_number"), "decree_queue_data"),
+                      on_conflict="national_id,appointment_number")
+        sb.upsert("decree_issued_decrees",
+                  _dedupe_for_upsert(decree_rows, ("decree_number",), "decree_issued_decrees"),
+                  on_conflict="decree_number")
+        sb.upsert("decree_dispensed_items",
+                  _dedupe_for_upsert(
+                      dispensed_rows,
+                      ("id_number", "decree_number", "item_name", "dispensing_date", "quantity", "price"),
+                      "decree_dispensed_items",
+                  ),
                   on_conflict="id_number,decree_number,item_name,dispensing_date,quantity,price")
         # Keep decree_name_map / item_name_map in sync with what we saw
         # this run -- inserts brand-new pending raw text, bumps
@@ -454,6 +463,41 @@ def main():
         get_decree_map().push_pending(pending_descriptions)
         get_item_map().push_pending(pending_items)
         logging.info("Sync complete.")
+
+
+# =====================================================================
+# Dedupe guard — Postgres/PostgREST rejects a batch upsert where two
+# rows in the SAME request share the same on_conflict key ("ON CONFLICT
+# DO UPDATE command cannot affect row a second time", error 21000).
+# That's not a hypothetical: e.g. decree_dispensed_items' key
+# (id_number, decree_number, item_name, dispensing_date, quantity,
+# price) deliberately does not include Receipt_ID, so two rows scraped
+# from two different receipts -- or a receipt line and a "billed but
+# not yet submitted" procedure-table line -- can land on an identical
+# key within one run. Since the schema already treats that key as "one
+# row", sending them one-at-a-time would just have the second silently
+# overwrite the first anyway; this collapses that before the batch POST
+# so it doesn't blow up mid-write. Keeps the LAST occurrence per key
+# (closest to "most recently seen this run").
+# =====================================================================
+def _dedupe_for_upsert(rows: list, key_fields: tuple, table_name: str) -> list:
+    if not rows:
+        return rows
+    by_key = {}
+    for row in rows:
+        key = tuple(row.get(f) for f in key_fields)
+        by_key[key] = row  # last one wins
+    deduped = list(by_key.values())
+    dropped = len(rows) - len(deduped)
+    if dropped:
+        logging.warning(
+            f"[{table_name}] {dropped} row(s) shared an on_conflict key ({', '.join(key_fields)}) "
+            f"with another row in this run's batch -- kept the last occurrence of each, dropped the "
+            f"rest before upserting, to avoid Postgres error 21000. If this number looks unexpectedly "
+            f"high, it's worth spot-checking whether real distinct events are colliding (e.g. two "
+            f"receipts dispensing the same item/qty/price on the same day)."
+        )
+    return deduped
 
 
 if __name__ == "__main__":
