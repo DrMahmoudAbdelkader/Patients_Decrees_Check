@@ -16,6 +16,17 @@ CREDENTIALS: no longer hardcoded. Set these as environment variables
 (GitHub Actions secrets in production):
     SMC_USERNAME
     SMC_PASSWORD
+
+Some pipeline steps (decree-list export, request-status export) must run
+under a SECOND, separate SMC account because that account can see data this
+one can't (and vice-versa). To support that without duplicating this whole
+file, SMCSession() now optionally takes an explicit username/password pair.
+If you don't pass any, it falls back to SMC_USERNAME / SMC_PASSWORD exactly
+like before -- so every existing caller (daily_sync.py) keeps working
+unchanged. For the second account, set:
+    SMC_USERNAME_2
+    SMC_PASSWORD_2
+(or pass whatever credentials you like straight into the constructor).
 """
 
 import os
@@ -32,11 +43,22 @@ BASE_URL = "https://smc.smcegy.com"
 USERNAME = os.environ.get("SMC_USERNAME", "")
 PASSWORD = os.environ.get("SMC_PASSWORD", "")
 
+# Second account, used only by pipeline steps that explicitly ask for it.
+USERNAME_2 = os.environ.get("SMC_USERNAME_2", "")
+PASSWORD_2 = os.environ.get("SMC_PASSWORD_2", "")
+
 
 class SMCSession:
-    """Manages the SMC website session and every API call the pipeline needs."""
+    """Manages the SMC website session and every API call the pipeline needs.
 
-    def __init__(self):
+    By default this logs in with SMC_USERNAME / SMC_PASSWORD (unchanged
+    behaviour). Pass username=/password= to use a different account --
+    e.g. SMCSession(username=smc.USERNAME_2, password=smc.PASSWORD_2).
+    """
+
+    def __init__(self, username: Optional[str] = None, password: Optional[str] = None):
+        self.username = username if username is not None else USERNAME
+        self.password = password if password is not None else PASSWORD
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -54,8 +76,8 @@ class SMCSession:
     # Login
     # ---------------------------------------------------------------
     def login(self) -> bool:
-        if not USERNAME or not PASSWORD:
-            logging.error("SMC_USERNAME / SMC_PASSWORD are not set (env vars).")
+        if not self.username or not self.password:
+            logging.error("SMC username/password not set for this session (env vars or constructor args).")
             return False
         try:
             logging.info("Logging in to SMC website...")
@@ -68,7 +90,7 @@ class SMCSession:
             token_input = soup.find('input', {'name': '__RequestVerificationToken'})
             verification_token = token_input.get('value') if token_input else None
 
-            login_data = {'username': USERNAME, 'password': PASSWORD}
+            login_data = {'username': self.username, 'password': self.password}
             if verification_token:
                 login_data['__RequestVerificationToken'] = verification_token
 
