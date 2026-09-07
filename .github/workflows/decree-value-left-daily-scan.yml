@@ -44,6 +44,8 @@ jobs:
         env:
           SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          HMIS_USERNAME: ${{ secrets.HMIS_USERNAME }}
+          HMIS_PASSWORD: ${{ secrets.HMIS_PASSWORD }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
