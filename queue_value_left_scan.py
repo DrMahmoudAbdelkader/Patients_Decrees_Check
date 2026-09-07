@@ -2,7 +2,14 @@
 queue_value_left_scan.py — daily automated "value left" coverage scan.
 
 Runs once a day (via GitHub Actions cron, separate from the on-demand
-lookup workflow and from daily_sync.py's own renewal pipeline):
+lookup workflow and from daily_sync.py's own renewal pipeline) OR
+on-demand, triggered from the app via the trigger-daily-scan Edge
+Function + decree_daily_scan_runs tracking table (see
+sql/decree_daily_scan_runs_schema.sql) -- same pattern as
+lookup_patient_decree_value.py's request_id/status flip, just for a
+whole-queue batch instead of one patient. When --request-id is NOT
+given (the cron path), every mark_run() call below is a no-op, so
+cron behavior is completely unchanged from before this revision.
 
   1. Pull the queue report for TOMORROW (today + 1 day) and keep only
      the rows whose Clinic name is a daycare-style clinic -- see
@@ -41,6 +48,11 @@ lookup workflow and from daily_sync.py's own renewal pipeline):
      with zero decrees on file -- see the note on that sentinel value
      in the schema/previous version of this script).
 
+  6. If --request-id was given (app-triggered run), flip that row in
+     decree_daily_scan_runs to 'done' (with scan_date + row/flag
+     counts) or 'error' (with a message) so the frontend's poll loop
+     knows when to stop and what to show.
+
 !! ASSUMPTIONS TO CONFIRM / ADJUST !!
   - DAYCARE_CLINICS: every clinic name in daily_sync.py's own
     ALLOWED_CLINICS that contains "day care" or "daycare". Edit the
@@ -68,7 +80,7 @@ import csv
 import time
 import logging
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -85,8 +97,35 @@ DAYCARE_CLINICS = {c for c in ALLOWED_CLINICS if 'day care' in c or 'daycare' in
 
 RESULTS_TABLE = "decree_value_left_daily_scan"
 REQUEST_STATUS_TABLE = "decree_request_status_daily_export"
+RUNS_TABLE = "decree_daily_scan_runs"
 
 DELAY_BETWEEN_PATIENTS = 0.5
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def mark_run(request_id, status, error_message=None, scan_date_iso=None,
+             row_count=None, flagged_count=None):
+    """
+    Flips decree_daily_scan_runs.status for an app-triggered run.
+    A no-op whenever request_id is falsy -- i.e. every cron/plain
+    manual-dispatch run, which never passes --request-id and so never
+    touches this table at all.
+    """
+    if not request_id:
+        return
+    body = {"status": status, "completed_at": _now_iso()}
+    if error_message:
+        body["error_message"] = error_message[:2000]
+    if scan_date_iso is not None:
+        body["scan_date"] = scan_date_iso
+    if row_count is not None:
+        body["row_count"] = row_count
+    if flagged_count is not None:
+        body["flagged_count"] = flagged_count
+    sb.patch(RUNS_TABLE, f"id=eq.{request_id}", body)
 
 
 def build_daycare_queue_rows(raw_records: list, appointment_date_iso: str) -> list:
@@ -227,7 +266,11 @@ def main():
     parser.add_argument("--date", default=None,
                          help="Scan this EXACT date instead of an offset from today (YYYY-MM-DD).")
     parser.add_argument("--out-dir", default="./dry_run_output")
+    parser.add_argument("--request-id", default=None,
+                         help="decree_daily_scan_runs.id (uuid) -- only set when triggered from the app. "
+                              "Omit for cron/plain manual runs; every tracking write becomes a no-op.")
     args = parser.parse_args()
+    request_id = args.request_id
 
     if args.date:
         target_date = datetime.strptime(args.date, "%Y-%m-%d")
@@ -238,17 +281,25 @@ def main():
     logging.info(f"Scan date: {target_iso}")
     logging.info(f"Daycare clinic filter: {sorted(DAYCARE_CLINICS)}")
 
-    raw_records = fetch_and_parse_queue(target_ddmmyyyy)
-    queue_rows = build_daycare_queue_rows(raw_records, target_iso)
+    try:
+        raw_records = fetch_and_parse_queue(target_ddmmyyyy)
+        queue_rows = build_daycare_queue_rows(raw_records, target_iso)
+    except Exception as e:
+        mark_run(request_id, "error", f"Queue fetch failed: {e}", scan_date_iso=target_iso)
+        logging.error(f"Queue fetch failed: {e}")
+        sys.exit(1)
+
     patient_ids = sorted({r["national_id"] for r in queue_rows})
     logging.info(f"{len(queue_rows)} daycare queue row(s) -> {len(patient_ids)} distinct patient(s).")
 
     if not patient_ids:
         logging.warning("No daycare-queue patients found for this date. Nothing to do.")
+        mark_run(request_id, "done", scan_date_iso=target_iso, row_count=0, flagged_count=0)
         return
 
     session = smc.SMCSession()
     if not session.login():
+        mark_run(request_id, "error", "SMC login failed.", scan_date_iso=target_iso)
         logging.error("SMC login failed — aborting.")
         sys.exit(1)
 
@@ -272,9 +323,16 @@ def main():
         os.makedirs(args.out_dir, exist_ok=True)
         write_csv(os.path.join(args.out_dir, "value_left_daily_scan.csv"), all_rows)
         logging.info(f"DRY RUN complete — review the CSV in {args.out_dir} before running for real.")
+        mark_run(request_id, "done", scan_date_iso=target_iso, row_count=len(all_rows), flagged_count=len(flagged))
     else:
-        sb.upsert(RESULTS_TABLE, all_rows, on_conflict="scan_date,patient_id,decree_number")
+        try:
+            sb.upsert(RESULTS_TABLE, all_rows, on_conflict="scan_date,patient_id,decree_number")
+        except Exception as e:
+            mark_run(request_id, "error", f"Failed to save results: {e}", scan_date_iso=target_iso)
+            logging.error(f"Failed to save results: {e}")
+            sys.exit(1)
         logging.info(f"Sync complete — {len(all_rows)} row(s) upserted into '{RESULTS_TABLE}'.")
+        mark_run(request_id, "done", scan_date_iso=target_iso, row_count=len(all_rows), flagged_count=len(flagged))
 
 
 if __name__ == "__main__":
