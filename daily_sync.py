@@ -2,14 +2,30 @@
 daily_sync.py — Decree Renewal daily pipeline entry point.
 
 Runs, once a day (via GitHub Actions):
-  1. Download the "Clinic List Detail - by Status" queue report for
-     TODAY + DATE_OFFSET_DAYS (default 15) from the HMIS webreport,
+  1. Download the "Clinic List Detail" queue report (outpat_clnc_lst_det_j)
+     for TODAY + DATE_OFFSET_DAYS (default 15) from the HMIS webreport,
      parse it into clean rows, keep only the outpatient clinics that
      matter for this workflow.
+  1b. That report only carries each patient's internal HMIS "Medical
+     No." (his_mr), not their 14-digit national ID -- resolve every
+     distinct Medical No. found in step 1 via hmis_id_resolver
+     (HMIS login + Central Index lookup, cache-first against
+     economy_patient_registry). A Medical No. that can't be resolved
+     this run is dropped (logged), never guessed at.
   2. Log in to SMC, pull every issued decree (+ death status) for each
      distinct patient found in step 1.
   3. Pull every dispensed/billed item for every decree found in step 2.
   4. Upsert all three result sets into Supabase.
+
+!! REVERT NOTE (2026) !!
+This pipeline briefly used "outpat_clnc_lst_det_sts_j" ("Clinic List
+Detail - BY STATUS"), which carried the National ID directly and
+needed no id-mapping step (see git history / queue_parser.py, still
+here in case that report comes back). That report started returning
+blank on the live site, so step 1/1b above reverted to the original
+outpat_clnc_lst_det_j report + a Medical No. -> national ID resolution
+step instead. See queue_extractor.py's REPORT_CODE comment and
+hmis_id_resolver.py.
 
 !! REDESIGN NOTE (mapping tables now dynamic, Supabase-backed) !!
 Raw-text -> unique-name normalization is no longer an Excel VLOOKUP.
@@ -50,10 +66,11 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(__file__))
 
 import queue_extractor as qx
-import queue_parser as qp
+import queue_parser as qp  # kept for outpat_clnc_lst_det_sts_j, currently unused (see revert note above)
 import smc_session as smc
 import supabase_client as sb
 from decree_name_map import normalize_decree_name, normalize_item_name, get_decree_map, get_item_map
+from hmis_id_resolver import HmisIdResolver
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -74,7 +91,12 @@ DELAY_BETWEEN_DECREES = 0.3
 # =====================================================================
 def fetch_and_parse_queue(date_ddmmyyyy: str) -> list:
     """Downloads + parses the queue report for a single day. Returns
-    clean record dicts (Clinic, National ID Number, Patient File No., ...)."""
+    clean record dicts shaped by queue_extractor.parse_clinic_report():
+    Date, Day, Clinic, Resource ID, Resource Name, Doctor ID, Doctor
+    Name, Medical No., Time, Slots, Patient Name, Financial Cat. Code,
+    Financial Category, Sex, Birth Date. Note: Medical No. here is the
+    INTERNAL HMIS id (his_mr), not the national ID -- see
+    build_queue_rows()."""
     date_slash = date_ddmmyyyy.replace('-', '/')
     session = qx.requests.Session()
 
@@ -85,29 +107,83 @@ def fetch_and_parse_queue(date_ddmmyyyy: str) -> list:
     qx.verify_report_date_range(content, date_slash, date_slash)
 
     logging.info("Parsing raw report into clean rows...")
-    records = qp.extract_records_from_workbook_bytes(content)
+    records, warnings = qx.parse_clinic_report(content)
+    if warnings:
+        for w in warnings:
+            logging.warning(f"[queue parse] {w}")
     logging.info(f"Parsed {len(records)} raw queue rows.")
     return records
 
 
-def build_queue_rows(raw_records: list, appointment_date_iso: str) -> list:
-    """Filters to the allowed clinics and shapes rows for decree_queue_data."""
-    rows = []
+def build_queue_rows(raw_records: list, appointment_date_iso: str,
+                      resolver: HmisIdResolver = None) -> list:
+    """Filters to the allowed clinics, resolves each row's internal
+    Medical No. to a 14-digit national ID (via hmis_id_resolver,
+    cache-first against economy_patient_registry), and shapes rows for
+    decree_queue_data.
+
+    A `resolver` can be passed in so a caller doing several date
+    ranges/scans in one run shares a single HMIS login instead of each
+    call creating (and logging into) its own -- see
+    queue_value_left_scan.py. If omitted, a private one is created.
+
+    A row whose Medical No. can't be resolved to a national ID this
+    run (HMIS lookup failure, patient not found, blank Medical No.) is
+    dropped -- logged, never guessed at -- since national_id is the
+    join key everything downstream depends on.
+
+    !! appointment_number substitution !!
+    outpat_clnc_lst_det_j has no "Appointment Number" field at all
+    (that only existed on the "_sts_" report this reverted from). The
+    Supabase upsert below is keyed on (national_id, appointment_number)
+    -- leaving appointment_number as None/NULL for every row would be
+    a real bug, not just a missing value: Postgres treats every NULL
+    as distinct for uniqueness purposes (same pitfall already called
+    out in queue_value_left_scan.py's own notes), so a patient queued
+    on two different days would upsert as two permanently-separate
+    rows instead of one being updated -- and a re-run of the SAME day
+    would pile up duplicates too. This report's "Time" column (the
+    patient's slot, e.g. "9:00") is the closest available stand-in for
+    "which visit, this day" -- distinct visits same day get distinct
+    keys, and re-running the same day's extraction updates existing
+    rows instead of duplicating them.
+    """
+    resolver = resolver or HmisIdResolver()
+
+    filtered = []
+    medical_numbers = set()
     for rec in raw_records:
         clinic = (rec.get("Clinic") or "").strip()
         if clinic.lower() not in ALLOWED_CLINICS:
             continue
-        national_id = str(rec.get("National ID Number") or "").strip()
+        medical_no = str(rec.get("Medical No.") or "").strip()
+        if not medical_no:
+            continue
+        filtered.append((clinic, medical_no, rec))
+        medical_numbers.add(medical_no)
+
+    national_id_by_mr = resolver.resolve(sorted(medical_numbers))
+    unresolved = medical_numbers - set(national_id_by_mr)
+    if unresolved:
+        logging.warning(
+            f"[queue] {len(unresolved)} Medical No.(s) could not be resolved to a national ID "
+            f"this run (dropped from decree_queue_data): {sorted(unresolved)[:10]}"
+            + (" ..." if len(unresolved) > 10 else "")
+        )
+
+    rows = []
+    for clinic, medical_no, rec in filtered:
+        national_id = national_id_by_mr.get(medical_no)
         if not national_id:
             continue
         rows.append({
             "clinic": clinic,
-            "mr_code": str(rec.get("Patient File No.") or "").strip() or None,
+            "mr_code": medical_no,
             "national_id": national_id,
-            "appointment_number": str(rec.get("Appointment Number") or "").strip() or None,
+            "appointment_number": str(rec.get("Time") or "").strip() or None,
             "appointment_date": appointment_date_iso,
-            "user": str(rec.get("User") or "").strip() or None,
-            "old_medical_no": str(rec.get("Old Medical No.") or "").strip() or None,
+            "user": None,           # not present on this report
+            "old_medical_no": None,  # not present on this report
         })
     return rows
 
@@ -409,7 +485,8 @@ def main():
         logging.info(f"Using {len(patient_ids)} patient ID(s) from {args.patients_file} (queue step skipped).")
     else:
         raw_records = fetch_and_parse_queue(target_ddmmyyyy)
-        queue_rows = build_queue_rows(raw_records, target_iso)
+        hmis_resolver = HmisIdResolver()
+        queue_rows = build_queue_rows(raw_records, target_iso, resolver=hmis_resolver)
         patient_ids = sorted({r["national_id"] for r in queue_rows})
         logging.info(f"{len(queue_rows)} queue row(s) in allowed clinics -> {len(patient_ids)} distinct patient(s).")
 

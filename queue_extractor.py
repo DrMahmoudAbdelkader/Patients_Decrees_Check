@@ -97,12 +97,16 @@ from openpyxl.utils import get_column_letter
 HOST            = "41.33.24.254:8080"
 WEBREPORT_BASE  = f"http://{HOST}/WebReport-JWEB"
 
-# CHANGED for the decree-renewal pipeline: "Clinic List Detail - BY STATUS"
-# (outpat_clnc_lst_det_sts_j) — the report whose fixed-column layout
-# queue_parser.py is built to read (has the National ID column). The
-# original "outpat_clnc_lst_det_j" report used by v6 of this script does
-# NOT carry a national ID column, which is why it's no longer used here.
-REPORT_CODE     = "outpat_clnc_lst_det_sts_j"
+# REVERTED (see hmis_id_resolver.py): "outpat_clnc_lst_det_sts_j"
+# ("Clinic List Detail - BY STATUS") started coming back blank on the
+# live site -- a bug on the HMIS side, not this script. Back on the
+# original "outpat_clnc_lst_det_j" report, which this file's own
+# parse_clinic_report() below was already built for. That report has
+# no National ID column (only the internal "Medical No." / his_mr), so
+# daily_sync.py now resolves each Medical No. to a national ID itself
+# via hmis_id_resolver.HmisIdResolver instead of reading it straight
+# off the report the way queue_parser.py did for the "_sts_" variant.
+REPORT_CODE     = "outpat_clnc_lst_det_j"
 LANG            = "L"
 HSCD            = "01"                          # hospital/branch code
 

@@ -87,6 +87,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import smc_session as smc
 import supabase_client as sb
 from daily_sync import fetch_and_parse_queue, build_queue_rows, ALLOWED_CLINICS
+from hmis_id_resolver import HmisIdResolver
 from patient_decree_value import get_patient_decree_value_details, evaluate_dose_coverage
 from lookup_patient_decree_value import fetch_pending_unsubmitted_value
 
@@ -128,10 +129,12 @@ def mark_run(request_id, status, error_message=None, scan_date_iso=None,
     sb.patch(RUNS_TABLE, f"id=eq.{request_id}", body)
 
 
-def build_daycare_queue_rows(raw_records: list, appointment_date_iso: str) -> list:
-    """Same shaping as daily_sync.build_queue_rows(), but filtered to
-    DAYCARE_CLINICS instead of the full ALLOWED_CLINICS set."""
-    rows = build_queue_rows(raw_records, appointment_date_iso)
+def build_daycare_queue_rows(raw_records: list, appointment_date_iso: str,
+                              resolver: HmisIdResolver = None) -> list:
+    """Same shaping (and Medical No. -> national ID resolution) as
+    daily_sync.build_queue_rows(), but filtered to DAYCARE_CLINICS
+    instead of the full ALLOWED_CLINICS set."""
+    rows = build_queue_rows(raw_records, appointment_date_iso, resolver=resolver)
     return [r for r in rows if r["clinic"].lower() in DAYCARE_CLINICS]
 
 
@@ -283,7 +286,8 @@ def main():
 
     try:
         raw_records = fetch_and_parse_queue(target_ddmmyyyy)
-        queue_rows = build_daycare_queue_rows(raw_records, target_iso)
+        hmis_resolver = HmisIdResolver()
+        queue_rows = build_daycare_queue_rows(raw_records, target_iso, resolver=hmis_resolver)
     except Exception as e:
         mark_run(request_id, "error", f"Queue fetch failed: {e}", scan_date_iso=target_iso)
         logging.error(f"Queue fetch failed: {e}")
