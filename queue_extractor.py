@@ -317,7 +317,7 @@ def set_field(fields, name, value):
 # ═════════════════════════════════════════════════════════════════
 
 VIEWSTATE_UPDATE_RE = re.compile(
-    r'<update\s+id="javax\.faces\.ViewState"[^>]*>\s*<!\[CDATA\[(.*?)\]\]>\s*</update>',
+    r'<update\s+id="[^"]*javax\.faces\.ViewState[^"]*"[^>]*>\s*<!\[CDATA\[(.*?)\]\]>\s*</update>',
     re.S,
 )
 
