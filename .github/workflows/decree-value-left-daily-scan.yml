@@ -4,6 +4,9 @@ name: Decree Value Left - Daily Coverage Scan
 # tomorrow's daycare/pharmacy patients are already flagged by the time
 # staff start their shift. Adjust the cron time (UTC!) to whatever
 # lead time you want before Cairo morning hours.
+#
+# All scripts live at the repo root (no repo_scripts/ subfolder), so
+# these steps run directly from the checkout with no working-directory.
 on:
   schedule:
     - cron: "0 3 * * *"   # 03:00 UTC = 05:00/06:00 Cairo depending on DST
@@ -27,11 +30,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        working-directory: repo_scripts
         run: pip install -r requirements.txt
 
       - name: Run daily scan
-        working-directory: repo_scripts
         env:
           SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
