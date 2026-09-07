@@ -23,24 +23,18 @@ Each table has a `status` column: 'pending' | 'mapped' | 'ignored'.
                 sync: insert new pending rows, bump times_seen/last_seen
                 on ones already pending. It never writes 'mapped' or
                 'ignored' -- only the app does that.
-
-normalize_decree_name() / normalize_item_name() / normalize_request_text()
-all return (value_or_None, action) where action is one of:
-    'mapped'   -> value is the unique name/description, include normally
-    'pending'  -> value is None, include the row with a NULL unique name
-    'ignored'  -> exclude the row entirely, do not touch the map row
-"""
-
+                
 import os
 import logging
+from datetime import datetime
 from datetime import datetime, timezone
 
 import supabase_client as sb
 
-_ORIGINAL_HINTS = ("original", "raw", "description", "name")  # kept for reference; no longer used for Excel
 
 
 def _now_iso():
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -65,80 +59,100 @@ class NameMap:
                 f"is fixed -- rows will still be kept (not dropped), just unmatched."
             )
             rows = []
-        for r in rows:
-            raw = r.get("raw_text")
-            if not raw:
-                continue
-            status = r.get("status")
-            if status == "mapped" and r.get(self.unique_col):
-                self.mapped[raw] = r[self.unique_col]
-            elif status == "ignored":
-                self.ignored.add(raw)
-            else:
-                self.pending.add(raw)
-        logging.info(
-            f"[{self.table}] loaded {len(self.mapped)} mapped, "
-            f"{len(self.ignored)} ignored, {len(self.pending)} pending."
-        )
+//   GITHUB_REPO_2      -- e.g. "Patients_Decrees_Check"
+//   GITHUB_WORKFLOW_FILE_2 -- "patient-decree-lookup.yml"
+//   GITHUB_REF_2       -- branch to dispatch on, e.g. "main"
+//
+// TEMP DEBUG: this build logs the exact resolved values right before
+// the GitHub dispatch call, so a stray trailing space/newline picked
+// up when a secret was pasted in becomes visible in the function logs
+// (it would otherwise be invisible -- `supabase secrets list` never
+// shows values back to you). Remove the console.log once confirmed
+// clean.
 
-    def lookup(self, raw_text: str):
-        if not raw_text:
-            return None, "ignored"  # nothing to map -- treat like excluded, not a pending row
-        raw_text = str(raw_text).strip()
-        if not raw_text:
-            return None, "ignored"
-        if raw_text in self.mapped:
-            return self.mapped[raw_text], "mapped"
-        if raw_text in self.ignored:
-            return None, "ignored"
-        return None, "pending"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-    def push_pending(self, seen_raw_texts: set):
-        """Upsert every raw_text seen this run that came back 'pending'.
-        Only sends {raw_text, last_seen} -- the DB trigger (see
-        supabase_schema_additions.sql) handles times_seen and refuses to
-        downgrade a row that became 'mapped'/'ignored' since load time."""
-        if not seen_raw_texts:
+    const requestId = inserted.id as string;
+
+    // ---- Step 2: trigger the GitHub Actions workflow ----
+    // TEMP DEBUG -- remove once the resolved values are confirmed clean.
+    console.log(
+        `DEBUG dispatch -> owner="${GITHUB_OWNER_2}" repo="${GITHUB_REPO_2}" file="${GITHUB_WORKFLOW_FILE_2}" ref="${GITHUB_REF_2}"`
+    );
+
+    const dispatchUrl = `https://api.github.com/repos/${GITHUB_OWNER_2}/${GITHUB_REPO_2}/actions/workflows/${GITHUB_WORKFLOW_FILE_2}/dispatches`;
+    const ghResp = await fetch(dispatchUrl, {
+        method: "POST",
+
+
+def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
+                  pending_categories: set) -> list:
+                  pending_categories: set, clinic: str = None) -> list:
+    """Returns the decree_value_left_daily_scan row(s) for one patient.
+    `pending_categories` accumulates every raw decree_description this
+    run that came back 'pending' from categorize_decree() (needs a
+        return [{
+            "scan_date": scan_date_iso,
+            "patient_id": patient_id,
+            "clinic": clinic,
+            # '' not None: Postgres treats every NULL as distinct for
+            # uniqueness purposes, so an ON CONFLICT upsert would never
+            # match a prior "no decree" row for this patient and would
+        out_rows.append({
+            "scan_date": scan_date_iso,
+            "patient_id": patient_id,
+            "clinic": clinic,
+            "decree_number": d["decree_number"],
+            "decree_description": d.get("decree_description"),
+            "treatment_plan_name": d.get("treatment_plan_name"),
+        sys.exit(1)
+
+    patient_ids = sorted({r["national_id"] for r in queue_rows})
+    # First clinic seen per patient -- carried into every scan row so the
+    # app's clinic column and clinic sort actually have data (this field
+    # was previously never written at all).
+    clinic_by_patient = {}
+    for r in queue_rows:
+        clinic_by_patient.setdefault(r["national_id"], r["clinic"])
+    logging.info(f"{len(queue_rows)} daycare queue row(s) -> {len(patient_ids)} distinct patient(s).")
+
+    if not patient_ids:
+    for idx, pid in enumerate(patient_ids, 1):
+        logging.info(f"[{idx}/{len(patient_ids)}] scanning patient {pid}...")
+        try:
+            all_rows.extend(scan_patient(pid, target_iso, session, pending_categories))
+            all_rows.extend(scan_patient(pid, target_iso, session, pending_categories,
+                                         clinic=clinic_by_patient.get(pid)))
+        except Exception as e:
+            logging.error(f"Failed to scan patient {pid}: {e}")
+        time.sleep(DELAY_BETWEEN_PATIENTS)
+
+    if pending_categories:
+        get_category_map().push_pending(pending_categories)
+    def push_pending_categories():
+        # Deliberately runs only AFTER the scan results are safely saved,
+        # and never raises: a failure here (e.g. the decree_category_map
+        # table missing from Supabase) previously crashed the run after
+        # all patients were scraped but BEFORE anything was written --
+        # destroying ~10 minutes of work. Now it's logged and swallowed.
+        if not pending_categories:
             return
-        now = _now_iso()
-        rows = [{"raw_text": t, "last_seen": now} for t in sorted(seen_raw_texts)]
-        sb.upsert(self.table, rows, on_conflict="raw_text")
-        logging.info(f"[{self.table}] upserted {len(rows)} pending raw value(s).")
+        try:
+            get_category_map().push_pending(pending_categories)
+        except Exception as e:
+            logging.error(f"[decree_category_map] push_pending failed (non-fatal): {e}")
 
-
-_decree_map = None
-_item_map = None
-_request_map = None
-
-
-def get_decree_map() -> NameMap:
-    global _decree_map
-    if _decree_map is None:
-        _decree_map = NameMap("decree_name_map", "unique_name")
-    return _decree_map
-
-
-def get_item_map() -> NameMap:
-    global _item_map
-    if _item_map is None:
-        _item_map = NameMap("item_name_map", "unique_name")
-    return _item_map
-
-
-def get_request_map() -> NameMap:
-    global _request_map
-    if _request_map is None:
-        _request_map = NameMap("request_name_map", "decree_unique_name")
-    return _request_map
-
-
-def normalize_decree_name(raw_description: str):
-    return get_decree_map().lookup(raw_description)
-
-
-def normalize_item_name(raw_item_name: str):
-    return get_item_map().lookup(raw_item_name)
-
-
-def normalize_request_text(raw_text: str):
-    return get_request_map().lookup(raw_text)
+    flagged = [r for r in all_rows if r["needs_attention"]]
+    still_needs_request = [r for r in flagged if not r["has_pending_request"]]
+        os.makedirs(args.out_dir, exist_ok=True)
+        write_csv(os.path.join(args.out_dir, "value_left_daily_scan.csv"), all_rows)
+        logging.info(f"DRY RUN complete — review the CSV in {args.out_dir} before running for real.")
+        push_pending_categories()
+        mark_run(request_id, "done", scan_date_iso=target_iso, row_count=len(all_rows), flagged_count=len(flagged))
+    else:
+        try:
+            logging.error(f"Failed to save results: {e}")
+            sys.exit(1)
+        logging.info(f"Sync complete — {len(all_rows)} row(s) upserted into '{RESULTS_TABLE}'.")
+        push_pending_categories()
+        mark_run(request_id, "done", scan_date_iso=target_iso, row_count=len(all_rows), flagged_count=len(flagged))
