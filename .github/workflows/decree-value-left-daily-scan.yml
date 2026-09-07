@@ -24,6 +24,14 @@ on:
         description: "decree_daily_scan_runs.id (uuid) -- set automatically when triggered from the app. Leave blank otherwise."
         required: false
 
+# Never run two scans at once (e.g. the nightly cron overlapping an
+# app-triggered run): the second one queues and starts when the first
+# finishes, instead of both logging in and scraping HMIS/SMC at the
+# same time.
+concurrency:
+  group: decree-value-left-daily-scan
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -36,6 +44,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"   # reuse the wheel cache between runs -- faster installs
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -48,12 +57,17 @@ jobs:
           HMIS_PASSWORD: ${{ secrets.HMIS_PASSWORD }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Workflow inputs are passed through env vars (NOT interpolated
+          # directly into the shell script) so a crafted input value can
+          # never inject shell commands.
+          INPUT_DATE: ${{ github.event.inputs.date }}
+          INPUT_REQUEST_ID: ${{ github.event.inputs.request_id }}
         run: |
           ARGS=""
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          if [ -n "$INPUT_DATE" ]; then
+            ARGS="$ARGS --date $INPUT_DATE"
           fi
-          if [ -n "${{ github.event.inputs.request_id }}" ]; then
-            ARGS="$ARGS --request-id ${{ github.event.inputs.request_id }}"
+          if [ -n "$INPUT_REQUEST_ID" ]; then
+            ARGS="$ARGS --request-id $INPUT_REQUEST_ID"
           fi
           python queue_value_left_scan.py $ARGS
