@@ -185,7 +185,7 @@ def fetch_pending_request_for_patient(patient_id: str, treatment_plan_name):
 
 
 def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
-                  pending_categories: set) -> list:
+                  pending_categories: set, clinic: str = None) -> list:
     """Returns the decree_value_left_daily_scan row(s) for one patient.
     `pending_categories` accumulates every raw decree_description this
     run that came back 'pending' from categorize_decree() (needs a
@@ -201,6 +201,7 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
         return [{
             "scan_date": scan_date_iso,
             "patient_id": patient_id,
+            "clinic": clinic,
             # '' not None: Postgres treats every NULL as distinct for
             # uniqueness purposes, so an ON CONFLICT upsert would never
             # match a prior "no decree" row for this patient and would
@@ -261,6 +262,7 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
         out_rows.append({
             "scan_date": scan_date_iso,
             "patient_id": patient_id,
+            "clinic": clinic,
             "decree_number": d["decree_number"],
             "decree_description": d.get("decree_description"),
             "treatment_plan_name": d.get("treatment_plan_name"),
@@ -328,6 +330,12 @@ def main():
         sys.exit(1)
 
     patient_ids = sorted({r["national_id"] for r in queue_rows})
+    # First clinic seen per patient -- carried into every scan row so the
+    # app's clinic column and clinic sort actually have data (this field
+    # was previously never written at all).
+    clinic_by_patient = {}
+    for r in queue_rows:
+        clinic_by_patient.setdefault(r["national_id"], r["clinic"])
     logging.info(f"{len(queue_rows)} daycare queue row(s) -> {len(patient_ids)} distinct patient(s).")
 
     if not patient_ids:
@@ -346,13 +354,24 @@ def main():
     for idx, pid in enumerate(patient_ids, 1):
         logging.info(f"[{idx}/{len(patient_ids)}] scanning patient {pid}...")
         try:
-            all_rows.extend(scan_patient(pid, target_iso, session, pending_categories))
+            all_rows.extend(scan_patient(pid, target_iso, session, pending_categories,
+                                         clinic=clinic_by_patient.get(pid)))
         except Exception as e:
             logging.error(f"Failed to scan patient {pid}: {e}")
         time.sleep(DELAY_BETWEEN_PATIENTS)
 
-    if pending_categories:
-        get_category_map().push_pending(pending_categories)
+    def push_pending_categories():
+        # Deliberately runs only AFTER the scan results are safely saved,
+        # and never raises: a failure here (e.g. the decree_category_map
+        # table missing from Supabase) previously crashed the run after
+        # all patients were scraped but BEFORE anything was written --
+        # destroying ~10 minutes of work. Now it's logged and swallowed.
+        if not pending_categories:
+            return
+        try:
+            get_category_map().push_pending(pending_categories)
+        except Exception as e:
+            logging.error(f"[decree_category_map] push_pending failed (non-fatal): {e}")
 
     flagged = [r for r in all_rows if r["needs_attention"]]
     still_needs_request = [r for r in flagged if not r["has_pending_request"]]
@@ -365,6 +384,7 @@ def main():
         os.makedirs(args.out_dir, exist_ok=True)
         write_csv(os.path.join(args.out_dir, "value_left_daily_scan.csv"), all_rows)
         logging.info(f"DRY RUN complete — review the CSV in {args.out_dir} before running for real.")
+        push_pending_categories()
         mark_run(request_id, "done", scan_date_iso=target_iso, row_count=len(all_rows), flagged_count=len(flagged))
     else:
         try:
@@ -374,6 +394,7 @@ def main():
             logging.error(f"Failed to save results: {e}")
             sys.exit(1)
         logging.info(f"Sync complete — {len(all_rows)} row(s) upserted into '{RESULTS_TABLE}'.")
+        push_pending_categories()
         mark_run(request_id, "done", scan_date_iso=target_iso, row_count=len(all_rows), flagged_count=len(flagged))
 
 
