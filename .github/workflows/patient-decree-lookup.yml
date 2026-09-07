@@ -1,0 +1,54 @@
+name: Patient Decree Value Lookup
+
+# Fired by the Edge Function (supabase/functions/patient-decree-lookup)
+# via workflow_dispatch, one run per "Search" click in the
+# decree-value-left module. request_id/patient_id are passed straight
+# through to lookup_patient_decree_value.py, which does the actual SMC
+# scrape + Enhanced Monitor join + regimen classification + Supabase
+# writes and flips the request's status to 'done' or 'error' when
+# finished.
+#
+# NOTE: this workflow reads decree_medication_catalog for the regimen
+# classification / dose-coverage check -- make sure
+# load_decree_medication_catalog.py has been run at least once (see
+# that script) before relying on treatment_plan_name / regimen_status
+# / next_dose_covered being populated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: "decree_value_lookup_requests.id (uuid)"
+        required: true
+      patient_id:
+        description: "Patient national ID to search for on SMC"
+        required: true
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: repo_scripts
+        run: pip install -r requirements.txt
+
+      - name: Run lookup
+        working-directory: repo_scripts
+        env:
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python lookup_patient_decree_value.py \
+            --request-id "${{ github.event.inputs.request_id }}" \
+            --patient-id "${{ github.event.inputs.patient_id }}"

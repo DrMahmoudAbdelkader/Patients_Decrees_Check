@@ -1,0 +1,45 @@
+name: Decree Value Left - Daily Coverage Scan
+
+# Runs once a day, well before the next day's clinics open, so
+# tomorrow's daycare/pharmacy patients are already flagged by the time
+# staff start their shift. Adjust the cron time (UTC!) to whatever
+# lead time you want before Cairo morning hours.
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC = 05:00/06:00 Cairo depending on DST
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Optional exact date to scan (YYYY-MM-DD). Leave blank for 'tomorrow'."
+        required: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: repo_scripts
+        run: pip install -r requirements.txt
+
+      - name: Run daily scan
+        working-directory: repo_scripts
+        env:
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python queue_value_left_scan.py --date "${{ github.event.inputs.date }}"
+          else
+            python queue_value_left_scan.py
+          fi
