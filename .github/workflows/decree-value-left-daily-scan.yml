@@ -7,6 +7,11 @@ name: Decree Value Left - Daily Coverage Scan
 #
 # All scripts live at the repo root (no repo_scripts/ subfolder), so
 # these steps run directly from the checkout with no working-directory.
+#
+# request_id is optional and only present when triggered from the app
+# (via the trigger-daily-scan Edge Function) -- cron and plain manual
+# "Run workflow" clicks leave it blank, and queue_value_left_scan.py
+# simply skips all decree_daily_scan_runs tracking in that case.
 on:
   schedule:
     - cron: "0 3 * * *"   # 03:00 UTC = 05:00/06:00 Cairo depending on DST
@@ -14,6 +19,9 @@ on:
     inputs:
       date:
         description: "Optional exact date to scan (YYYY-MM-DD). Leave blank for 'tomorrow'."
+        required: false
+      request_id:
+        description: "decree_daily_scan_runs.id (uuid) -- set automatically when triggered from the app. Leave blank otherwise."
         required: false
 
 jobs:
@@ -39,8 +47,11 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
+          ARGS=""
           if [ -n "${{ github.event.inputs.date }}" ]; then
-            python queue_value_left_scan.py --date "${{ github.event.inputs.date }}"
-          else
-            python queue_value_left_scan.py
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
           fi
+          if [ -n "${{ github.event.inputs.request_id }}" ]; then
+            ARGS="$ARGS --request-id ${{ github.event.inputs.request_id }}"
+          fi
+          python queue_value_left_scan.py $ARGS
