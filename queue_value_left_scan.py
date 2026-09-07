@@ -185,6 +185,7 @@ def fetch_pending_request_for_patient(patient_id: str, treatment_plan_name):
 
 
 def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
+                  pending_categories: set) -> list:
                   pending_categories: set, clinic: str = None) -> list:
     """Returns the decree_value_left_daily_scan row(s) for one patient.
     `pending_categories` accumulates every raw decree_description this
@@ -354,12 +355,15 @@ def main():
     for idx, pid in enumerate(patient_ids, 1):
         logging.info(f"[{idx}/{len(patient_ids)}] scanning patient {pid}...")
         try:
+            all_rows.extend(scan_patient(pid, target_iso, session, pending_categories))
             all_rows.extend(scan_patient(pid, target_iso, session, pending_categories,
                                          clinic=clinic_by_patient.get(pid)))
         except Exception as e:
             logging.error(f"Failed to scan patient {pid}: {e}")
         time.sleep(DELAY_BETWEEN_PATIENTS)
 
+    if pending_categories:
+        get_category_map().push_pending(pending_categories)
     def push_pending_categories():
         # Deliberately runs only AFTER the scan results are safely saved,
         # and never raises: a failure here (e.g. the decree_category_map
