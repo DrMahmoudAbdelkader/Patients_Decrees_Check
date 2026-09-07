@@ -90,6 +90,7 @@ from daily_sync import fetch_and_parse_queue, build_queue_rows, ALLOWED_CLINICS
 from hmis_id_resolver import HmisIdResolver
 from patient_decree_value import get_patient_decree_value_details, evaluate_dose_coverage
 from lookup_patient_decree_value import fetch_pending_unsubmitted_value
+from decree_category import categorize_decree, get_category_map
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -140,9 +141,22 @@ def build_daycare_queue_rows(raw_records: list, appointment_date_iso: str,
 
 def fetch_pending_request_for_patient(patient_id: str, treatment_plan_name):
     """
-    Returns (request_number, request_status, request_treatment_plan)
-    for the first matching row in decree_request_status_daily_export,
-    or (None, None, None) if none.
+    Returns (request_number, request_status, request_unique_name,
+    request_original_description) for the first matching row in
+    decree_request_status_daily_export, or (None, None, None, None) if
+    none.
+
+    !! BUG FIX !! This used to select only request_number, request_status,
+    decree_unique_name -- it never selected requested_decree_original_description
+    at all, so even once request_status_sync.py's own extraction bug was
+    fixed (see that file), the actual free-text treatment plan submitted
+    with the request still never reached decree_value_left_daily_scan or
+    the app. request_unique_name (decree_unique_name, the NORMALIZED name
+    used only for the join above) and request_original_description (the
+    raw text actually typed/attached to the request) are now both
+    returned and kept as two separate fields by scan_patient() below --
+    don't collapse them back into one, they answer different questions
+    ("what did we match it to" vs "what does the request actually say").
 
     If treatment_plan_name is None (patient has no decree at all, or
     its raw description isn't in decree_medication_catalog yet), falls
@@ -156,21 +170,34 @@ def fetch_pending_request_for_patient(patient_id: str, treatment_plan_name):
         filters += f"&decree_unique_name=eq.{treatment_plan_name}"
     rows = sb.fetch_all(
         REQUEST_STATUS_TABLE,
-        "request_number,request_status,decree_unique_name",
+        "request_number,request_status,decree_unique_name,requested_decree_original_description",
         filters=filters,
     )
     if not rows:
-        return None, None, None
+        return None, None, None, None
     r = rows[0]
-    return r.get("request_number"), r.get("request_status"), r.get("decree_unique_name")
+    return (
+        r.get("request_number"),
+        r.get("request_status"),
+        r.get("decree_unique_name"),
+        r.get("requested_decree_original_description"),
+    )
 
 
-def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession) -> list:
-    """Returns the decree_value_left_daily_scan row(s) for one patient."""
+def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
+                  pending_categories: set) -> list:
+    """Returns the decree_value_left_daily_scan row(s) for one patient.
+    `pending_categories` accumulates every raw decree_description this
+    run that came back 'pending' from categorize_decree() (needs a
+    human to assign it a category) -- one shared set across the whole
+    run, pushed to decree_category_map once at the end of main() (see
+    decree_category.py), same push-once-per-run pattern as
+    decree_name_map.py's NameMap.push_pending()."""
     decrees = get_patient_decree_value_details(session, patient_id)
 
     if not decrees:
-        request_number, request_status, request_plan = fetch_pending_request_for_patient(patient_id, None)
+        request_number, request_status, request_plan, request_original_desc = \
+            fetch_pending_request_for_patient(patient_id, None)
         return [{
             "scan_date": scan_date_iso,
             "patient_id": patient_id,
@@ -195,6 +222,8 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession) -
             "pending_request_number": request_number,
             "pending_request_status": request_status,
             "pending_request_treatment_plan": request_plan,
+            "pending_request_original_description": request_original_desc,
+            "category": None,
             "needs_attention": True,  # no decree at all -> always needs attention
         }]
 
@@ -220,11 +249,14 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession) -
         else:
             needs_attention = False
 
-        request_number = request_status = request_plan = None
+        request_number = request_status = request_plan = request_original_desc = None
         if needs_attention:
-            request_number, request_status, request_plan = fetch_pending_request_for_patient(
-                patient_id, d.get("treatment_plan_name")
-            )
+            request_number, request_status, request_plan, request_original_desc = \
+                fetch_pending_request_for_patient(patient_id, d.get("treatment_plan_name"))
+
+        category, category_action = categorize_decree(d.get("decree_description"))
+        if category_action == "pending" and d.get("decree_description"):
+            pending_categories.add(d["decree_description"])
 
         out_rows.append({
             "scan_date": scan_date_iso,
@@ -233,6 +265,7 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession) -
             "decree_description": d.get("decree_description"),
             "treatment_plan_name": d.get("treatment_plan_name"),
             "regimen_status": d.get("regimen_status"),
+            "category": category,
             "decree_total_value": d.get("decree_total_value"),
             "decree_value_left_website": website_left,
             "decree_status": d.get("decree_status"),
@@ -245,6 +278,7 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession) -
             "pending_request_number": request_number,
             "pending_request_status": request_status,
             "pending_request_treatment_plan": request_plan,
+            "pending_request_original_description": request_original_desc,
             "needs_attention": needs_attention,
         })
     return out_rows
@@ -308,13 +342,17 @@ def main():
         sys.exit(1)
 
     all_rows = []
+    pending_categories = set()
     for idx, pid in enumerate(patient_ids, 1):
         logging.info(f"[{idx}/{len(patient_ids)}] scanning patient {pid}...")
         try:
-            all_rows.extend(scan_patient(pid, target_iso, session))
+            all_rows.extend(scan_patient(pid, target_iso, session, pending_categories))
         except Exception as e:
             logging.error(f"Failed to scan patient {pid}: {e}")
         time.sleep(DELAY_BETWEEN_PATIENTS)
+
+    if pending_categories:
+        get_category_map().push_pending(pending_categories)
 
     flagged = [r for r in all_rows if r["needs_attention"]]
     still_needs_request = [r for r in flagged if not r["has_pending_request"]]

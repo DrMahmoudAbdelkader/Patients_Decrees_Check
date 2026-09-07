@@ -54,10 +54,12 @@ Usage:
 """
 
 import os
+import re
 import csv
 import sys
 import time
 import json
+import html
 import logging
 import argparse
 from datetime import datetime
@@ -173,10 +175,30 @@ def fetch_request_status_list(session: smc.SMCSession, date_iso: str) -> list:
 # =====================================================================
 # STEP 2 — treatment plan per request (same session)
 # =====================================================================
+# !! BUG FIX (confirmed against a known-good reference script) !!
+# The previous version used BeautifulSoup's textarea.get_text(strip=True),
+# which strips each text node individually and joins them back with NO
+# separator -- for a multi-line textarea that silently glues the end of
+# one line directly onto the start of the next, and it kept the
+# textarea's FIRST line, which is a fixed program name (e.g. "علاج مبادرة
+# سرطان الثدى"), not part of the actual description at all. Both bugs
+# together explain rows coming back with the number extracted fine but
+# the description missing/mangled/prefixed with boilerplate. Switched to
+# a plain regex over the raw HTML + an explicit line split, matching
+# Extract_Decrees_Requests_Descriptions_Modified.py (already verified
+# against this exact page) field-for-field: split on real newlines,
+# drop the first line when there's more than one, keep the rest.
+_TREATMENT_PLAN_RE = re.compile(
+    r'<textarea[^>]*id="teatmentPlan"[^>]*>(.*?)</textarea>',  # SMC's own typo, kept as-is
+    re.DOTALL | re.IGNORECASE,
+)
+
+
 def get_treatment_plan(session: smc.SMCSession, request_number: str):
     url = f"{BASE_URL}/smc/Requests/Details/{request_number}"
     try:
         resp = session.session.get(url, timeout=30)
+        resp.encoding = "utf-8"
     except Exception as e:
         logging.error(f"Error fetching request details for {request_number}: {e}")
         return None
@@ -184,13 +206,18 @@ def get_treatment_plan(session: smc.SMCSession, request_number: str):
         logging.warning(f"Request details for {request_number} returned HTTP {resp.status_code}.")
         return None
 
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(resp.text, 'html.parser')
-    textarea = soup.find('textarea', {'id': 'teatmentPlan'})  # SMC's own typo, kept as-is
-    if not textarea:
+    match = _TREATMENT_PLAN_RE.search(resp.text)
+    if not match:
         return None
-    text = textarea.get_text(strip=True)
-    return text or None
+    raw = html.unescape(match.group(1)).strip()
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    if len(lines) == 1:
+        return lines[0]
+    # First line is the fixed program name; everything after it is the
+    # actual description.
+    return "\n".join(lines[1:])
 
 
 def fetch_treatment_plans(session: smc.SMCSession, request_numbers: list) -> dict:
