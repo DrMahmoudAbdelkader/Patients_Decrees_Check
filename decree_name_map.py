@@ -33,7 +33,7 @@ all return (value_or_None, action) where action is one of:
 
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import supabase_client as sb
 
@@ -41,7 +41,7 @@ _ORIGINAL_HINTS = ("original", "raw", "description", "name")  # kept for referen
 
 
 def _now_iso():
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class NameMap:
