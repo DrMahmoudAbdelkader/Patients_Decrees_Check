@@ -13,6 +13,9 @@ name: Patient Decree Value Lookup
 # load_decree_medication_catalog.py has been run at least once (see
 # that script) before relying on treatment_plan_name / regimen_status
 # / next_dose_covered being populated.
+#
+# All scripts live at the repo root (no repo_scripts/ subfolder), so
+# these steps run directly from the checkout with no working-directory.
 
 on:
   workflow_dispatch:
@@ -38,11 +41,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        working-directory: repo_scripts
         run: pip install -r requirements.txt
 
       - name: Run lookup
-        working-directory: repo_scripts
         env:
           SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
