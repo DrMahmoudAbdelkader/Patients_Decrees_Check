@@ -312,15 +312,30 @@ def evaluate_dose_coverage(decree: Dict, real_value_left: Optional[float],
 
     Returns:
         True  -- enough real value left for one more dose, and not expired.
-        False -- insufficient (expired, OR real_value_left <= 500 for a
-                  supportive/pain decree, OR real_value_left < that
-                  decree's average_dose_value for a real medication
-                  decree).
+        False -- insufficient: expired, OR real_value_left is below this
+                  decree's threshold (see below).
         None  -- can't tell: real_value_left is unknown, OR this is a
                   non-supportive decree with no average_dose_value yet
                   in decree_medication_catalog (needs_cutoff_value) --
                   never guessed at, surface as "no cutoff data" instead
                   of silently defaulting to True or False.
+
+    Threshold used, in order of precedence:
+        1. decree_medication_catalog's average_dose_value for THIS raw
+           description, whenever it's set -- including 0. Your catalog
+           carries a different cutoff per decree (most supportive
+           decrees are 0, but e.g. the pain/anti-emetic supportive
+           decree is deliberately 500), so a per-decree 0 always means
+           "no floor, any non-negative real value left is fine",
+           regardless of whether the decree is flagged is_supportive.
+        2. Only when average_dose_value is unset (None) for a
+           supportive decree: the SUPPORTIVE_VALUE_FLOOR fallback,
+           so an old/unmapped supportive decree that hasn't had a
+           per-decree cutoff filled in yet still gets a sane default
+           instead of silently passing.
+        3. Only when average_dose_value is unset for a non-supportive
+           decree: None (unknown -- needs_cutoff_value, surfaced for a
+           human to fill in rather than guessed at).
 
     Only meaningful for decree['regimen_status'] == 'current' --
     superseded/previous-cycle decrees aren't the ones a patient would
@@ -333,10 +348,11 @@ def evaluate_dose_coverage(decree: Dict, real_value_left: Optional[float],
     if is_decree_expired(decree.get('decree_expiry_date'), as_of_iso):
         return False
 
+    average_dose_value = decree.get('average_dose_value')
+    if average_dose_value is not None:
+        return real_value_left >= average_dose_value
+
     if decree.get('is_supportive'):
         return real_value_left > SUPPORTIVE_VALUE_FLOOR
 
-    average_dose_value = decree.get('average_dose_value')
-    if average_dose_value is None:
-        return None
-    return real_value_left >= average_dose_value
+    return None
