@@ -43,6 +43,26 @@ cron behavior is completely unchanged from before this revision.
      "already requested Drug X, status: <status>" from "no request on
      file yet -> needs a new decree request raised."
 
+     REVISION: the site itself caps a patient at 2 concurrently OPEN
+     requests, and a request only counts as "open" while its status
+     is one of the known non-final ones (see REQUEST_FINAL_STATUSES /
+     _is_pending_status below) -- everything else (final decision,
+     administrative letter, cancelled, ...) is resolved and no longer
+     blocks a new request. The previous version fetched with NO status
+     filter at all and kept only the first row Postgres happened to
+     return, so (a) a long-closed request could get shown as "the"
+     pending one instead of a genuinely open one, and (b) a patient
+     with two simultaneously open requests only ever surfaced one of
+     them. fetch_patient_pending_requests() now fetches every request
+     row for the patient ONCE (not per-decree -- the 2-request cap is
+     patient-wide, not decree-specific), filters to the ones that are
+     actually still open, and keeps at most the 2 most recent --
+     matching the site's own limit exactly. The result is written both
+     as the original flat scalar columns (first/most-recent open
+     request, for anything still reading those) AND as a new
+     `pending_requests` jsonb array with up to 2 entries, so the app
+     can show both without guessing which one "the" request is.
+
   5. Upsert one row per (scan_date, patient_id, decree_number) into
      decree_value_left_daily_scan (decree_number is '' for a patient
      with zero decrees on file -- see the note on that sentinel value
@@ -80,6 +100,7 @@ import csv
 import time
 import logging
 import argparse
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -102,6 +123,25 @@ REQUEST_STATUS_TABLE = "decree_request_status_daily_export"
 RUNS_TABLE = "decree_daily_scan_runs"
 
 DELAY_BETWEEN_PATIENTS = 0.5
+
+# The 4 statuses that mean a request is RESOLVED (final decision either
+# way, cancelled, or converted to an administrative letter) -- exact
+# text as it comes back from the site. Everything else -- including any
+# status text not in this list, e.g. a new one the site adds later --
+# is treated as still OPEN (see _is_pending_status). That's
+# deliberately the conservative direction: an unrecognized status
+# should never silently hide a request that might still be active.
+REQUEST_FINAL_STATUSES = {
+    "قرار نهائى",
+    "خطاب ادارى",
+    "إلغاء بناءاً على طلب المريض أو مندوب المستشفي",
+    "قرار ملغي",
+}
+
+# The maximum number of concurrently open requests the site itself
+# allows per patient -- once a patient has this many open requests,
+# no new one can be submitted for them until one resolves.
+MAX_OPEN_REQUESTS_PER_PATIENT = 2
 
 
 def _now_iso():
@@ -139,49 +179,50 @@ def build_daycare_queue_rows(raw_records: list, appointment_date_iso: str,
     return [r for r in rows if r["clinic"].lower() in DAYCARE_CLINICS]
 
 
-def fetch_pending_request_for_patient(patient_id: str, treatment_plan_name):
-    """
-    Returns (request_number, request_status, request_unique_name,
-    request_original_description) for the first matching row in
-    decree_request_status_daily_export, or (None, None, None, None) if
-    none.
+def _is_pending_status(status: Optional[str]) -> bool:
+    """A request counts as still OPEN unless its status is one of the
+    known final ones. None/blank status (shouldn't normally happen,
+    but data can be messy) is also treated as open -- conservative on
+    purpose, see REQUEST_FINAL_STATUSES above."""
+    if not status:
+        return True
+    return status.strip() not in REQUEST_FINAL_STATUSES
 
-    !! BUG FIX !! This used to select only request_number, request_status,
-    decree_unique_name -- it never selected requested_decree_original_description
-    at all, so even once request_status_sync.py's own extraction bug was
-    fixed (see that file), the actual free-text treatment plan submitted
-    with the request still never reached decree_value_left_daily_scan or
-    the app. request_unique_name (decree_unique_name, the NORMALIZED name
-    used only for the join above) and request_original_description (the
-    raw text actually typed/attached to the request) are now both
-    returned and kept as two separate fields by scan_patient() below --
-    don't collapse them back into one, they answer different questions
-    ("what did we match it to" vs "what does the request actually say").
 
-    If treatment_plan_name is None (patient has no decree at all, or
-    its raw description isn't in decree_medication_catalog yet), falls
-    back to matching on patient_id alone -- still useful signal ("this
-    patient has *some* pending request on file"), just not
-    decree-specific. See the naming-mismatch caveat in this script's
-    top docstring.
+def fetch_patient_pending_requests(patient_id: str) -> list:
     """
-    filters = f"patient_id=eq.{patient_id}"
-    if treatment_plan_name:
-        filters += f"&decree_unique_name=eq.{treatment_plan_name}"
+    Returns up to MAX_OPEN_REQUESTS_PER_PATIENT (2) currently-OPEN
+    requests for this patient, most recent first, each as a dict:
+        {request_number, request_status, request_unique_name,
+         request_original_description, request_date}
+    or an empty list if the patient has none open right now.
+
+    Fetched ONCE per patient (not per-decree, unlike the old
+    fetch_pending_request_for_patient) since the open-request cap is
+    patient-wide, not tied to any one decree -- see the naming-mismatch
+    caveat in this script's top docstring for why a specific decree
+    can't always be matched to a specific request by name alone.
+    """
     rows = sb.fetch_all(
         REQUEST_STATUS_TABLE,
-        "request_number,request_status,decree_unique_name,requested_decree_original_description",
-        filters=filters,
+        "request_number,request_status,decree_unique_name,requested_decree_original_description,request_date",
+        filters=f"patient_id=eq.{patient_id}",
     )
-    if not rows:
-        return None, None, None, None
-    r = rows[0]
-    return (
-        r.get("request_number"),
-        r.get("request_status"),
-        r.get("decree_unique_name"),
-        r.get("requested_decree_original_description"),
-    )
+    open_rows = [r for r in rows if _is_pending_status(r.get("request_status"))]
+    # Most recent request_date first; a missing date sorts last rather
+    # than crashing the comparison.
+    open_rows.sort(key=lambda r: r.get("request_date") or "", reverse=True)
+    open_rows = open_rows[:MAX_OPEN_REQUESTS_PER_PATIENT]
+    return [
+        {
+            "request_number": r.get("request_number"),
+            "request_status": r.get("request_status"),
+            "request_unique_name": r.get("decree_unique_name"),
+            "request_original_description": r.get("requested_decree_original_description"),
+            "request_date": r.get("request_date"),
+        }
+        for r in open_rows
+    ]
 
 
 def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
@@ -195,9 +236,30 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
     decree_name_map.py's NameMap.push_pending()."""
     decrees = get_patient_decree_value_details(session, patient_id)
 
+    # Fetched ONCE per patient regardless of how many decrees they
+    # have or whether any of them need attention -- the open-request
+    # cap (and the fact that a request exists at all) is patient-wide
+    # info the app wants to show even for a patient whose decrees all
+    # look fine right now.
+    patient_pending = fetch_patient_pending_requests(patient_id)
+    has_any_pending = len(patient_pending) > 0
+    # Kept for anything still reading the old flat scalar columns --
+    # the most recent open request, or all-None if there isn't one.
+    first_pending = patient_pending[0] if patient_pending else {}
+    pending_scalar_fields = {
+        "has_pending_request": has_any_pending,
+        "pending_request_number": first_pending.get("request_number"),
+        "pending_request_status": first_pending.get("request_status"),
+        "pending_request_treatment_plan": first_pending.get("request_unique_name"),
+        "pending_request_original_description": first_pending.get("request_original_description"),
+        # New: the full (up to 2) list of currently open requests for
+        # this patient, so the app can show BOTH instead of guessing
+        # which one is "the" pending request. Same list on every row
+        # for this patient -- it's patient-level info, not per-decree.
+        "pending_requests": patient_pending,
+    }
+
     if not decrees:
-        request_number, request_status, request_plan, request_original_desc = \
-            fetch_pending_request_for_patient(patient_id, None)
         return [{
             "scan_date": scan_date_iso,
             "patient_id": patient_id,
@@ -219,13 +281,9 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
             "pending_unsubmitted_value": 0,
             "real_value_left": None,
             "next_dose_covered": None,
-            "has_pending_request": request_number is not None,
-            "pending_request_number": request_number,
-            "pending_request_status": request_status,
-            "pending_request_treatment_plan": request_plan,
-            "pending_request_original_description": request_original_desc,
             "category": None,
             "needs_attention": True,  # no decree at all -> always needs attention
+            **pending_scalar_fields,
         }]
 
     out_rows = []
@@ -250,11 +308,6 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
         else:
             needs_attention = False
 
-        request_number = request_status = request_plan = request_original_desc = None
-        if needs_attention:
-            request_number, request_status, request_plan, request_original_desc = \
-                fetch_pending_request_for_patient(patient_id, d.get("treatment_plan_name"))
-
         category, category_action = categorize_decree(d.get("decree_description"))
         if category_action == "pending" and d.get("decree_description"):
             pending_categories.add(d["decree_description"])
@@ -276,12 +329,8 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
             "pending_unsubmitted_value": pending_value,
             "real_value_left": real_left,
             "next_dose_covered": dose_covered,
-            "has_pending_request": request_number is not None,
-            "pending_request_number": request_number,
-            "pending_request_status": request_status,
-            "pending_request_treatment_plan": request_plan,
-            "pending_request_original_description": request_original_desc,
             "needs_attention": needs_attention,
+            **pending_scalar_fields,
         })
     return out_rows
 
