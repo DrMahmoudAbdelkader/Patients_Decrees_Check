@@ -30,9 +30,14 @@ This module adds two things daily_sync.py doesn't need:
 
 REGIMEN CLASSIFICATION (per your Q1/Q2/Q5 answers)
 ----------------------------------------------------
-Every decree is looked up in decree_medication_catalog by its EXACT
-raw description text, giving: treatment_plan_name (the simple name
-shown to users), is_cycles, average_dose_value, is_supportive.
+Every decree is looked up in decree_medication_catalog (the live
+Supabase table -- Excel is only ever the offline source used to
+populate/update that table, never read at match time) by its
+description, normalized via normalize_decree_description() on both
+sides to strip formatting noise (extra whitespace, Arabic tashkeel,
+alef-hamza variants) that would otherwise cause a real match to be
+missed. This gives: treatment_plan_name (the simple name shown to
+users), is_cycles, average_dose_value, is_supportive.
 
 Decrees are then grouped by (patient, treatment_plan_name) -- NOT by
 raw description, since cycle decrees of the same treatment
@@ -66,6 +71,8 @@ comparisons need.
 """
 
 import logging
+import re
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -79,13 +86,58 @@ SUPPORTIVE_VALUE_FLOOR = 500  # EGP -- your Q4 rule
 
 _catalog_cache: Optional[Dict[str, Dict]] = None
 
+# Arabic tashkeel/diacritics (harakat, tanween, shadda, sukun, etc.) --
+# stripped because the SMC website is inconsistent about including them
+# while your catalog rows (typed by hand) usually aren't.
+_ARABIC_DIACRITICS_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED\u0670]")
+_TATWEEL_RE = re.compile(r"\u0640")  # ـ elongation character
+_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200F\uFEFF]")
+_WHITESPACE_RE = re.compile(r"\s+")
+_ALEF_VARIANTS_RE = re.compile(r"[\u0622\u0623\u0625\u0671]")  # آ أ إ ٱ -> ا
+
+
+def normalize_decree_description(text: Optional[str]) -> str:
+    """Canonical form used as the catalog match key on BOTH sides
+    (the live decree_medication_catalog rows loaded from Supabase, and
+    the raw description scraped off the SMC website), so a match is
+    never lost purely to formatting differences that don't change what
+    the decree actually is: NFKC-normalizes, strips zero-width chars
+    and Arabic diacritics/tatweel, folds alef-hamza variants to a bare
+    alef, collapses all whitespace runs to a single space, and trims.
+    This is deliberately NOT a fuzzy/approximate match -- two
+    descriptions that differ in real wording still won't match; it
+    only neutralizes formatting noise that has no bearing on identity.
+    """
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFKC", text)
+    t = _ZERO_WIDTH_RE.sub("", t)
+    t = _ARABIC_DIACRITICS_RE.sub("", t)
+    t = _TATWEEL_RE.sub("", t)
+    t = _ALEF_VARIANTS_RE.sub("\u0627", t)
+    t = _WHITESPACE_RE.sub(" ", t)
+    return t.strip()
+
 
 def _load_catalog() -> Dict[str, Dict]:
     """Loads decree_medication_catalog once per process and caches it
     -- this is called once per decree per patient, so re-fetching the
     (small, ~230-row) catalog every time would be wasteful. Call
     reset_catalog_cache() in a long-lived process if the catalog table
-    changes mid-run (not needed for the one-shot CLI scripts here)."""
+    changes mid-run (not needed for the one-shot CLI scripts here).
+
+    Keyed by normalize_decree_description(decree_description), not the
+    raw column value -- this is the live Supabase catalog table (not
+    Excel), but an exact-string key is still brittle against harmless
+    formatting drift (extra spaces, missing/extra tashkeel, a
+    different alef-hamza form) between what you typed into the catalog
+    and what the SMC website hands back for the same decree. If two
+    catalog rows normalize to the same key, the row with a real
+    average_dose_value wins (so a stray unmapped/duplicate row can
+    never shadow a properly filled-in one); ties among equally-filled
+    rows keep whichever was returned first, and are logged so you can
+    clean up the duplicate.
+    """
     global _catalog_cache
     if _catalog_cache is not None:
         return _catalog_cache
@@ -98,7 +150,34 @@ def _load_catalog() -> Dict[str, Dict]:
         logging.error(f"[value-left] could not load {CATALOG_TABLE} ({e}) -- "
                        f"all decrees will come back 'unmapped' this run.")
         rows = []
-    _catalog_cache = {r["decree_description"]: r for r in rows if r.get("decree_description")}
+
+    cache: Dict[str, Dict] = {}
+    collisions = []
+    for r in rows:
+        raw_desc = r.get("decree_description")
+        if not raw_desc:
+            continue
+        key = normalize_decree_description(raw_desc)
+        if not key:
+            continue
+        existing = cache.get(key)
+        if existing is None:
+            cache[key] = r
+        elif existing.get("decree_description") != raw_desc:
+            collisions.append((existing.get("decree_description"), raw_desc))
+            # Prefer whichever row actually has a cutoff value, so an
+            # unmapped duplicate can't shadow the real one.
+            if existing.get("average_dose_value") is None and r.get("average_dose_value") is not None:
+                cache[key] = r
+
+    if collisions:
+        logging.warning(
+            f"[value-left] {len(collisions)} pair(s) of {CATALOG_TABLE} rows normalize to the same "
+            f"key (near-duplicate descriptions) -- kept the one with average_dose_value where only "
+            f"one had it: {collisions[:5]}" + (" ..." if len(collisions) > 5 else "")
+        )
+
+    _catalog_cache = cache
     logging.info(f"[value-left] loaded {len(_catalog_cache)} row(s) from {CATALOG_TABLE}.")
     return _catalog_cache
 
@@ -190,7 +269,7 @@ def get_patient_decree_value_details(session: smc.SMCSession, national_id: str) 
             issuing_date = parse_smc_date(row_data.get('Date'))
             due_period_days = parse_due_period_days(details.get('Decree_Text_Col6'))
 
-            catalog_entry = catalog.get((description or '').strip(), {})
+            catalog_entry = catalog.get(normalize_decree_description(description), {})
 
             results.append({
                 'decree_number': decree_number,
