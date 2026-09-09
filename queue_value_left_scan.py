@@ -499,6 +499,52 @@ def main():
         try:
             sb.upsert(RESULTS_TABLE, all_rows, on_conflict="scan_date,patient_id,decree_number")
         except Exception as e:
+            # !! SAFETY NET !!
+            # A single missing/uncached column here (Postgres error
+            # PGRST204 -- "Could not find the 'X' column ... in the
+            # schema cache") used to fail this ONE batch upsert for
+            # EVERY patient scanned today, silently freezing the whole
+            # decree_value_left_daily_scan table at whatever the last
+            # successful run wrote -- no visible error in the app, just
+            # stale data that looked like a sync bug. If that's what
+            # just happened, retry once with any field(s) not present in
+            # the table's schema cache stripped out, so today's real
+            # data (pending requests, dose coverage, etc.) still lands
+            # even if one newer optional column (e.g. admin_letter_notices)
+            # hasn't been migrated in Supabase yet. This is a fallback,
+            # not a substitute for actually running the migration --
+            # the missing column's data just won't be saved until you do.
+            msg = str(e)
+            if "PGRST204" in msg or "schema cache" in msg:
+                import re as _re
+                missing_cols = set(_re.findall(r"'([a-zA-Z_][a-zA-Z0-9_]*)' column", msg))
+                if missing_cols:
+                    logging.error(
+                        f"[{RESULTS_TABLE}] upsert failed because column(s) {sorted(missing_cols)} "
+                        f"don't exist yet in Supabase (see error below) -- retrying WITHOUT them so "
+                        f"today's run isn't a total loss. Run the matching ALTER TABLE / "
+                        f"NOTIFY pgrst, 'reload schema' in Supabase to stop needing this fallback: {msg}"
+                    )
+                    stripped_rows = [
+                        {k: v for k, v in row.items() if k not in missing_cols}
+                        for row in all_rows
+                    ]
+                    try:
+                        sb.upsert(RESULTS_TABLE, stripped_rows, on_conflict="scan_date,patient_id,decree_number")
+                        logging.warning(
+                            f"[{RESULTS_TABLE}] retry succeeded WITHOUT {sorted(missing_cols)} -- "
+                            f"today's other data is saved, but that field is missing for every "
+                            f"row until the column is added."
+                        )
+                        mark_run(request_id, "done", scan_date_iso=target_iso,
+                                  row_count=len(all_rows), flagged_count=len(flagged))
+                        push_pending_categories()
+                        return
+                    except Exception as e2:
+                        mark_run(request_id, "error", f"Failed to save results (retry also failed): {e2}",
+                                  scan_date_iso=target_iso)
+                        logging.error(f"Retry without {sorted(missing_cols)} also failed: {e2}")
+                        sys.exit(1)
             mark_run(request_id, "error", f"Failed to save results: {e}", scan_date_iso=target_iso)
             logging.error(f"Failed to save results: {e}")
             sys.exit(1)

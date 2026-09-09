@@ -539,9 +539,24 @@ def main():
             write_csv(os.path.join(args.out_dir, "admin_letters.csv"),
                       [{k: v for k, v in r.items() if k != "all_letters"} for r in admin_letter_rows])
         elif admin_letter_rows:
-            sb.upsert(ADMIN_LETTER_TABLE, admin_letter_rows, on_conflict="request_number")
-            logging.info(f"Admin-letter sync complete — {len(admin_letter_rows)} row(s) upserted into "
-                         f"'{ADMIN_LETTER_TABLE}'.")
+            try:
+                sb.upsert(ADMIN_LETTER_TABLE, admin_letter_rows, on_conflict="request_number")
+                logging.info(f"Admin-letter sync complete — {len(admin_letter_rows)} row(s) upserted into "
+                             f"'{ADMIN_LETTER_TABLE}'.")
+            except Exception as e:
+                # Step 3 (decree_request_status_daily_export) already
+                # committed successfully above -- don't let a schema
+                # problem on this newer, separate table (e.g. a column
+                # like all_letters not yet migrated in Supabase) take
+                # down the exit code / mask that the main status sync
+                # worked. Logged loudly instead so it's never silently
+                # zero admin letters with no explanation.
+                logging.error(
+                    f"[{ADMIN_LETTER_TABLE}] upsert FAILED ({e}) -- {len(admin_letter_rows)} admin-letter "
+                    f"row(s) found this run were NOT saved. This is very likely a missing/uncached column "
+                    f"on {ADMIN_LETTER_TABLE} in Supabase (check for PGRST204 in the message above) -- "
+                    f"the main status sync above still completed fine, only this admin-letter piece failed."
+                )
 
 
 if __name__ == "__main__":
