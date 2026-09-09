@@ -112,6 +112,8 @@ from hmis_id_resolver import HmisIdResolver
 from patient_decree_value import get_patient_decree_value_details, evaluate_dose_coverage
 from lookup_patient_decree_value import fetch_pending_unsubmitted_value
 from decree_category import categorize_decree, get_category_map
+from admin_letter_lookup import is_admin_letter_status
+from cairo_date import cairo_today_iso
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -121,6 +123,13 @@ DAYCARE_CLINICS = {c for c in ALLOWED_CLINICS if 'day care' in c or 'daycare' in
 RESULTS_TABLE = "decree_value_left_daily_scan"
 REQUEST_STATUS_TABLE = "decree_request_status_daily_export"
 RUNS_TABLE = "decree_daily_scan_runs"
+# NEW — written by request_status_sync.py's Step 4 (see that script for
+# the fetch side). Read-only here: this scan only surfaces what's
+# already there, filtered again by recency at READ time (not just at
+# write time) so a notice naturally disappears once it ages out, with
+# no separate cleanup/delete job needed.
+ADMIN_LETTER_TABLE = "decree_admin_letter_details"
+DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 10))
 
 DELAY_BETWEEN_PATIENTS = 0.5
 
@@ -225,6 +234,50 @@ def fetch_patient_pending_requests(patient_id: str) -> list:
     ]
 
 
+def fetch_patient_admin_letter_notices(patient_id: str, admin_letter_lookback_days: int = None) -> list:
+    """
+    ADDITIVE alongside fetch_patient_pending_requests() -- this never
+    removes or replaces anything from `pending_requests`. It surfaces a
+    SEPARATE signal: any request that recently came back as an
+    administrative letter (خطاب ادارى / خطاب إداري -- usually a decline
+    or redirect rather than a granted decree) is, per
+    queue_value_left_scan.REQUEST_FINAL_STATUSES, already treated as a
+    RESOLVED/closed request and so never appears in the pending list at
+    all -- which is correct for "is a NEW request needed", but silently
+    drops the fact that a request WAS just declined, which is exactly
+    the context a reviewer wants right after seeing "no pending
+    request" for a decree that still needs attention.
+
+    Recency is re-checked HERE (not just at write time in
+    request_status_sync.py) against admin_letter_lookback_days (default
+    10, or $ADMIN_LETTER_LOOKBACK_DAYS) so a notice naturally stops
+    showing once it's old news, without a separate cleanup job.
+    """
+    lookback_days = admin_letter_lookback_days if admin_letter_lookback_days is not None else DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS
+    rows = sb.fetch_all(
+        ADMIN_LETTER_TABLE,
+        "request_number,request_date,request_status,treatment_plan,committee_date,response_text",
+        filters=f"patient_id=eq.{patient_id}",
+    )
+    if not rows:
+        return []
+    today_iso = cairo_today_iso()
+    cutoff_iso = (datetime.strptime(today_iso, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    recent = [r for r in rows if r.get("request_date") and cutoff_iso <= r["request_date"] <= today_iso]
+    recent.sort(key=lambda r: r.get("request_date") or "", reverse=True)
+    return [
+        {
+            "request_number": r.get("request_number"),
+            "request_date": r.get("request_date"),
+            "request_status": r.get("request_status"),
+            "treatment_plan": r.get("treatment_plan"),
+            "committee_date": r.get("committee_date"),
+            "response_text": r.get("response_text"),
+        }
+        for r in recent
+    ]
+
+
 def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
                   pending_categories: set, clinic: str = None) -> list:
     """Returns the decree_value_left_daily_scan row(s) for one patient.
@@ -257,6 +310,11 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
         # which one is "the" pending request. Same list on every row
         # for this patient -- it's patient-level info, not per-decree.
         "pending_requests": patient_pending,
+        # NEW, purely additive (see fetch_patient_admin_letter_notices
+        # docstring): recent admin-letter responses for this patient --
+        # shown ALONGSIDE pending_requests, never instead of it, as the
+        # last piece of context ("here's what happened last time").
+        "admin_letter_notices": fetch_patient_admin_letter_notices(patient_id),
     }
 
     if not decrees:
