@@ -35,6 +35,16 @@ on:
         type: string
         default: ''
 
+      request_status_lookback_days:
+        description: 'request_status_sync.py: re-check request status for the last N days (not just today), so open requests get refreshed instead of freezing at their day-one status.'
+        type: string
+        default: '15'
+
+      admin_letter_lookback_days:
+        description: 'request_status_sync.py: fetch the actual letter response text for any request at an admin-letter status (خطاب ادارى) within the last N days.'
+        type: string
+        default: '10'
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -115,11 +125,14 @@ jobs:
           python promote_hospital_decrees.py
 
       # -----------------------------------------------------------------
-      # New job F: decree requests placed for patients, for TODAY.
-      # Same second SMC account, single session.
+      # New job F: decree request STATUS, refreshed for a rolling window
+      # (default last 15 days, not just today -- see the LOOKBACK_DAYS
+      # note in request_status_sync.py for why a single-day query used
+      # to leave every request's status frozen at its creation-day value
+      # forever). Same second SMC account, single session.
       # Skipped during a backfill run (see backfill step below instead).
       # -----------------------------------------------------------------
-      - name: Run request status sync (today's placed requests)
+      - name: Run request status sync (refresh last N days of requests)
         if: ${{ github.event.inputs.backfill_start_date == '' }}
         env:
           SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
@@ -127,9 +140,11 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          ARGS=""
+          LOOKBACK="${{ github.event.inputs.request_status_lookback_days || '15' }}"
+          ADMIN_LETTER_LOOKBACK="${{ github.event.inputs.admin_letter_lookback_days || '10' }}"
+          ARGS="--lookback-days $LOOKBACK --admin-letter-lookback-days $ADMIN_LETTER_LOOKBACK"
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            ARGS="--dry-run"
+            ARGS="$ARGS --dry-run"
           fi
           echo "Running: python request_status_sync.py $ARGS"
           python request_status_sync.py $ARGS
