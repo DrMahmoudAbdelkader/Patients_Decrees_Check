@@ -146,6 +146,7 @@ def main():
             "pending_unsubmitted_value": pending_value,
             "real_value_left": real_value_left,
             "treatment_plan_name": d.get("treatment_plan_name"),
+            "reception_display_name": d.get("reception_display_name"),
             "is_cycles": d.get("is_cycles", False),
             "is_supportive": d.get("is_supportive", False),
             "average_dose_value": d.get("average_dose_value"),

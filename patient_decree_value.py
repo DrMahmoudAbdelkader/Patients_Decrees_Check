@@ -211,7 +211,7 @@ def _load_catalog() -> Dict[str, Dict]:
     try:
         rows = sb.fetch_all(
             CATALOG_TABLE,
-            "decree_description,treatment_plan_name,is_cycles,average_dose_value,is_supportive,"
+            "decree_description,treatment_plan_name,reception_display_name,is_cycles,average_dose_value,is_supportive,"
             "exclusivity_group,financial_review_scope,depot_value,depot_interval_months,partner_value",
         )
     except Exception as e:
@@ -347,10 +347,10 @@ def get_patient_decree_value_details(session: smc.SMCSession, national_id: str) 
         decree_number, decree_description, decree_total_value,
         decree_value_left_website, decree_status, issuing_date,
         decree_due_period_days, decree_expiry_date,
-        treatment_plan_name, is_cycles, average_dose_value,
-        is_supportive, exclusivity_group, financial_review_scope,
-        depot_value, depot_interval_months, partner_value,
-        regimen_status
+        treatment_plan_name, reception_display_name, is_cycles,
+        average_dose_value, is_supportive, exclusivity_group,
+        financial_review_scope, depot_value, depot_interval_months,
+        partner_value, regimen_status
 
     Never raises for a single malformed row -- it's skipped and
     logged, so one bad decree never blocks the rest of a patient's
@@ -395,6 +395,7 @@ def get_patient_decree_value_details(session: smc.SMCSession, national_id: str) 
                 'decree_due_period_days': due_period_days,
                 'decree_expiry_date': _compute_expiry_date(issuing_date, due_period_days),
                 'treatment_plan_name': catalog_entry.get('treatment_plan_name'),
+                'reception_display_name': catalog_entry.get('reception_display_name'),
                 'is_cycles': bool(catalog_entry.get('is_cycles')),
                 'average_dose_value': catalog_entry.get('average_dose_value'),
                 'is_supportive': bool(catalog_entry.get('is_supportive')),
