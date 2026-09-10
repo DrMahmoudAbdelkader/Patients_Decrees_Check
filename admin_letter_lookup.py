@@ -78,12 +78,37 @@ def extract_response_text(html: str, pipe_text: str) -> str:
     return _pipe_field(pipe_text, "نص الخطاب")
 
 
+def _ddmmyyyy_to_iso(value: str) -> Optional[str]:
+    """'08-08-2026' -> '2026-08-08'. The site renders committee_date as
+    DD-MM-YYYY; everything else in this codebase (request_date, scan_date,
+    cutoff comparisons in queue_value_left_scan.fetch_patient_admin_letter_notices)
+    is plain ISO YYYY-MM-DD, and a raw string comparison between the two
+    formats is silently wrong (e.g. '08-08-2026' sorts nothing like
+    '2026-08-08'). Converted once here, at the source, so nothing
+    downstream has to remember the site's format. Returns None (not the
+    original string) on anything that doesn't parse -- a caller should
+    treat that the same as "no committee date known", not display a
+    malformed one."""
+    if not value:
+        return None
+    m = re.match(r"^(\d{2})-(\d{2})-(\d{4})$", value.strip())
+    if not m:
+        return None
+    dd, mm, yyyy = m.groups()
+    try:
+        return f"{yyyy}-{mm}-{dd}" if 1 <= int(mm) <= 12 and 1 <= int(dd) <= 31 else None
+    except ValueError:
+        return None
+
+
 def _extract_committee_date(html: str, pipe_text: str) -> str:
+    """Returns ISO YYYY-MM-DD (see _ddmmyyyy_to_iso), or '' if no committee
+    date was found / it didn't parse as a real DD-MM-YYYY date."""
     m = re.search(r"تاريخ اللجنة\s*<br\s*/?>\s*([\d٠-٩]{2}-[\d٠-٩]{2}-[\d٠-٩]{4})", html)
-    if m:
-        return _ar2en(m.group(1)).strip()
-    raw = _pipe_field(pipe_text, "تاريخ اللجنة")
-    return _ar2en(raw).strip() if raw else ""
+    raw_ddmmyyyy = _ar2en(m.group(1)).strip() if m else _ar2en(_pipe_field(pipe_text, "تاريخ اللجنة")).strip()
+    if not raw_ddmmyyyy:
+        return ""
+    return _ddmmyyyy_to_iso(raw_ddmmyyyy) or ""
 
 
 # =====================================================================

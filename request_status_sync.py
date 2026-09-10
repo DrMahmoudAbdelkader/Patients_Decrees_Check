@@ -135,7 +135,31 @@ DEFAULT_LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", 15))
 # alongside/after it. See fetch_admin_letters_for_window() below and
 # ADMIN_LETTER_TABLE / decree_admin_letter_details.
 ADMIN_LETTER_TABLE = "decree_admin_letter_details"
-DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 10))
+DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 20))
+
+# !! BUG FIX #2 (the actual reason "recent" admin letters kept going
+# missing) !!
+# find_admin_letter_candidates() used to pre-filter candidates by each
+# request's SUBMISSION date (request_date) before we'd even fetched the
+# letter itself -- but "was this letter resulted recently" is a
+# question about the COMMITTEE's decision date, not about when the
+# request was originally submitted. A request submitted 25 days ago
+# that only got its admin-letter response yesterday was being thrown
+# away by that pre-filter (submission date outside the window) even
+# though the letter itself is brand new. Fix: STEP 4 below no longer
+# filters by submission-date recency at all -- every row already found
+# at an admin-letter status this run (whether from the normal Step-1
+# window or from the stale-request refresh pass, see
+# fetch_stale_open_requests()) gets its letter fetched and saved,
+# unconditionally. The actual "is this recent" decision moves entirely
+# to READ time in queue_value_left_scan.fetch_patient_admin_letter_notices(),
+# which now compares against committee_date (falling back to
+# request_date only when a committee_date couldn't be parsed) --
+# ADMIN_LETTER_LOOKBACK_DAYS is consumed there, not here. Kept here too
+# (unused by find_admin_letter_candidates now) only because main()'s
+# --admin-letter-lookback-days flag is still the one thing operators
+# tune, and it's simplest for both ends of the pipeline to default from
+# the same env var.
 
 
 # =====================================================================
@@ -382,39 +406,203 @@ def build_output_rows(list_rows: list, plans: dict) -> list:
 
 
 # =====================================================================
-# STEP 4 (NEW) — admin-letter response text for recently-declined requests
+# STEP 3b (NEW) — re-check requests that have aged OUT of the rolling
+# window while still marked open (the actual root cause of "shows
+# requests caught from very far away time instead of the fresh SMC
+# data")
 # =====================================================================
-def find_admin_letter_candidates(output_rows: list, today_iso: str, lookback_days: int) -> list:
-    """Rows whose status is an admin-letter status AND whose own
-    submission date (already correctly parsed per-row -- see
-    build_output_rows) falls within the last `lookback_days` days of
-    `today_iso`. Pure/no I/O, easy to unit-check independently of the
-    network calls in fetch_admin_letters_for_window()."""
-    cutoff = (datetime.strptime(today_iso, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+# !! BUG FIX #1 !!
+# Step 1 only ever re-queries requests SUBMITTED within the last
+# --lookback-days days (default 15). That's fine for a request that
+# gets resolved quickly -- but any request still open (non-final
+# status) once its submission date falls OUTSIDE that window simply
+# stops being touched by Step 1 ever again: its row in
+# decree_request_status_daily_export stays frozen forever at whatever
+# status it happened to have on the last day it was still inside the
+# window, even though the real site has since moved it forward (or
+# resolved it). queue_value_left_scan.fetch_patient_pending_requests()
+# then reads that frozen row and reports it as "still pending" straight
+# out of the past -- which is exactly what showed up in the app as
+# requests "caught from very far away time" instead of freshly
+# extracted data.
+#
+# Fix: separately look up every request in decree_request_status_daily_export
+# that is (a) older than this run's own window (Step 1 will already
+# refresh anything newer) and (b) still marked as a non-final/open
+# status, and re-check each one's REAL current status directly via
+# SendRequestStatusJson filtered by RequestNumber alone (no date-window
+# match needed for that filter) -- see fetch_single_request_status().
+# This self-heals a frozen row no matter how old it is, every single
+# run, with no separate backfill step required.
+#
+# Local copy of the "resolved" status set -- MUST be kept identical to
+# queue_value_left_scan.REQUEST_FINAL_STATUSES. Not imported directly
+# from there on purpose: queue_value_left_scan.py pulls in a much
+# heavier dependency chain (smc_session, daily_sync, hmis_id_resolver,
+# patient_decree_value, ...) that this script has no other reason to
+# load.
+REQUEST_FINAL_STATUSES = {
+    "قرار نهائى",
+    "خطاب ادارى",
+    "إلغاء بناءاً على طلب المريض أو مندوب المستشفي",
+    "قرار ملغي",
+}
+
+
+def _is_open_status(status) -> bool:
+    """Mirrors queue_value_left_scan._is_pending_status exactly: no/blank
+    status is treated as still open (conservative on purpose -- an
+    unrecognized status should never silently stop being refreshed)."""
+    if not status:
+        return True
+    return status.strip() not in REQUEST_FINAL_STATUSES
+
+
+def fetch_stale_open_requests(older_than_iso: str) -> list:
+    """Every row in SUPABASE_TABLE whose request_date is older than this
+    run's own window (older_than_iso == this run's start_date) AND whose
+    last-saved status is still one of the OPEN ones -- i.e. exactly the
+    rows Step 1 will NOT touch this run, and so would otherwise stay
+    frozen. Paginates via supabase_client.fetch_all() like everything
+    else here."""
+    # Each status double-quoted (matching the in-list quoting convention
+    # already used elsewhere in this repo, e.g. promote_hospital_decrees.py)
+    # since these are Arabic strings with spaces -- PostgREST needs the
+    # quoting to treat each one as a single list element.
+    statuses_quoted = ",".join(f'"{s}"' for s in REQUEST_FINAL_STATUSES)
+    rows = sb.fetch_all(
+        SUPABASE_TABLE,
+        "request_number,patient_id,patient_name,request_status,request_date,"
+        "requested_decree_original_description",
+        filters=(
+            f"request_date=lt.{older_than_iso}"
+            f"&or=(request_status.is.null,request_status.not.in.({statuses_quoted}))"
+        ),
+    )
+    return [r for r in rows if _is_open_status(r.get("request_status"))]
+
+
+def fetch_single_request_status(session: smc.SMCSession, request_number: str, today_iso: str):
+    """Re-queries SendRequestStatusJson for exactly ONE request_number via
+    its RequestNumber filter, with StartDate pinned far in the past --
+    bypassing the normal rolling date-window entirely, since a stale
+    request's submission date is (by definition, here) outside it.
+    Returns a row dict shaped like fetch_request_status_list()'s rows,
+    or None if the site no longer returns anything for this number
+    (never raises)."""
+    url = f"{BASE_URL}/smc/Reports/SendRequestStatusJson"
+    payload = {
+        'CitizenName': '',
+        'StartDate': _smc_datetime_str("2015-01-01"),
+        'EndDate': _smc_datetime_str(today_iso, end_of_day=True),
+        'SsnNumber': '',
+        'RequestNumber': request_number,
+        'RequestStatusId': '',
+        'SystemUserId': '',
+    }
+    try:
+        resp = session.session.post(url, data=payload, timeout=30)
+    except Exception as e:
+        logging.error(f"[stale-refresh] {request_number}: request failed ({e})")
+        return None
+    if resp.status_code != 200:
+        logging.warning(f"[stale-refresh] {request_number}: HTTP {resp.status_code}")
+        return None
+    try:
+        raw = resp.json()
+    except ValueError:
+        raw = resp.text
+    for rec in _parse_send_request_status_json(raw):
+        if _clean_id(rec.get('REQUESTID')) == request_number:
+            return {
+                'request_number': request_number,
+                'patient_name': (rec.get('CITIZENFULLNAMEARABIC') or '').strip() or None,
+                'patient_id': _clean_id(rec.get('CITIZENSSN')) or None,
+                'request_status': (rec.get('STATUSARABICNAME') or '').strip() or None,
+                'request_date': _parse_dotnet_date(rec.get('REQUESTDATE'), fallback_iso=None),
+            }
+    logging.info(f"[stale-refresh] {request_number}: no longer returned by the site at all (kept as-is).")
+    return None
+
+
+def refresh_stale_open_requests(session: smc.SMCSession, older_than_iso: str, today_iso: str,
+                                 already_covered: set, limit: int = 300) -> list:
+    """Runs fetch_stale_open_requests() + fetch_single_request_status()
+    for each result, and returns rows shaped exactly like
+    build_output_rows()'s output so the caller can merge them straight
+    into the same upsert / admin-letter pass. `already_covered` is the
+    set of request_numbers Step 1 already refreshed this run (should
+    never overlap since those are all newer than older_than_iso, but
+    checked defensively). Capped at `limit` per run so a large backlog
+    can't blow up a single run's duration -- any excess is simply
+    picked up on the next run(s)."""
+    stale = [r for r in fetch_stale_open_requests(older_than_iso) if r["request_number"] not in already_covered]
+    if not stale:
+        logging.info(f"No stale open request(s) older than {older_than_iso} found — nothing to re-check.")
+        return []
+    if len(stale) > limit:
+        logging.warning(f"{len(stale)} stale open request(s) found — capping this run's re-check to the "
+                         f"oldest {limit} (the rest will be picked up on a later run).")
+        stale.sort(key=lambda r: r.get("request_date") or "")
+        stale = stale[:limit]
+    logging.info(f"Re-checking real current status for {len(stale)} stale open request(s) "
+                 f"(submitted before {older_than_iso}, still marked open)...")
+
     out = []
-    for row in output_rows:
-        if not letters.is_admin_letter_status(row.get("request_status")):
-            continue
-        req_date = row.get("request_date")
-        if not req_date or not (cutoff <= req_date <= today_iso):
-            continue
-        out.append(row)
+    changed = 0
+    for i, row in enumerate(stale, 1):
+        request_number = row["request_number"]
+        fresh = fetch_single_request_status(session, request_number, today_iso)
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+        old_status = row.get("request_status")
+        new_status = fresh.get("request_status") if fresh else old_status
+        if fresh and new_status != old_status:
+            changed += 1
+            logging.info(f"[stale-refresh] {request_number}: status changed "
+                         f"'{old_status}' -> '{new_status}'.")
+        out.append({
+            "request_number": request_number,
+            "patient_name": (fresh or {}).get("patient_name") or row.get("patient_name"),
+            "request_date": (fresh or {}).get("request_date") or row.get("request_date"),
+            "patient_id": (fresh or {}).get("patient_id") or row.get("patient_id"),
+            "requested_decree_original_description": row.get("requested_decree_original_description"),
+            "request_status": new_status,
+        })
+        if i % 25 == 0:
+            logging.info(f"  ...{i}/{len(stale)} stale request(s) re-checked")
+    logging.info(f"Stale-refresh complete — {len(out)} request(s) re-checked, {changed} had a status change.")
     return out
 
 
-def fetch_admin_letters_for_window(session: smc.SMCSession, output_rows: list,
-                                    today_iso: str, lookback_days: int) -> list:
-    """For every candidate from find_admin_letter_candidates(), fetches
+# =====================================================================
+# STEP 4 (NEW) — admin-letter response text for recently-declined requests
+# =====================================================================
+def find_admin_letter_candidates(output_rows: list, today_iso: str = None, lookback_days: int = None) -> list:
+    """Rows whose CURRENT status is an admin-letter status. No longer
+    filtered by submission-date recency here (see the BUG FIX #2 note
+    near ADMIN_LETTER_TABLE above) -- every admin-letter-status row
+    found this run gets its letter fetched and stored; recency is
+    decided downstream, at read time, using the letter's own
+    committee_date. `today_iso`/`lookback_days` are accepted but unused
+    -- kept only so any existing caller passing them doesn't break.
+    Pure/no I/O, easy to unit-check independently of the network calls
+    in fetch_admin_letters_for_window()."""
+    return [row for row in output_rows if letters.is_admin_letter_status(row.get("request_status"))]
+
+
+def fetch_admin_letters_for_window(session: smc.SMCSession, output_rows: list) -> list:
+    """For every candidate from find_admin_letter_candidates() (every row
+    at an admin-letter status this run -- see the BUG FIX #2 note near
+    ADMIN_LETTER_TABLE for why this is no longer date-filtered), fetches
     the actual letter response text/committee date and shapes one
     Supabase row per request_number. Never raises on a single request's
     failure -- one bad fetch shouldn't drop every other admin letter
     found this run."""
-    candidates = find_admin_letter_candidates(output_rows, today_iso, lookback_days)
+    candidates = find_admin_letter_candidates(output_rows)
     if not candidates:
-        logging.info(f"No admin-letter status found within the last {lookback_days} day(s) — nothing to fetch.")
+        logging.info("No admin-letter status found this run — nothing to fetch.")
         return []
-    logging.info(f"{len(candidates)} request(s) at an admin-letter status within the last {lookback_days} "
-                 f"day(s) — fetching their response text...")
+    logging.info(f"{len(candidates)} request(s) at an admin-letter status this run — fetching their response text...")
 
     out_rows = []
     for i, row in enumerate(candidates, 1):
@@ -469,12 +657,23 @@ def main():
                               "(default 15, or $LOOKBACK_DAYS), so open requests get their CURRENT status "
                               "refreshed daily instead of freezing at whatever it was on their creation day.")
     parser.add_argument("--admin-letter-lookback-days", type=int, default=DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS,
-                         help="For any request whose status is an admin letter (خطاب ادارى / خطاب إداري) and "
-                              "whose submission date is within this many days of today (default 10, or "
-                              "$ADMIN_LETTER_LOOKBACK_DAYS), also fetch and save the letter's own response "
-                              "text -- ADDITIVE, never replaces the pending-requests info.")
+                         help="DEPRECATED / accepted but unused here -- this script now fetches+saves the "
+                              "response text for EVERY request found at an admin-letter status this run, "
+                              "with no submission-date pre-filter (see BUG FIX #2 near ADMIN_LETTER_TABLE). "
+                              "The 'is this recent' decision moved to read time in "
+                              "queue_value_left_scan.fetch_patient_admin_letter_notices(), which is where "
+                              "this same value (default 20, or $ADMIN_LETTER_LOOKBACK_DAYS) actually matters "
+                              "now. Kept here only so existing callers/workflows passing this flag don't break.")
     parser.add_argument("--skip-admin-letters", action="store_true",
                          help="Skip the admin-letter response-text fetch entirely (just the status sync).")
+    parser.add_argument("--skip-stale-refresh", action="store_true",
+                         help="Skip Step 3b (re-checking requests that have aged out of --lookback-days while "
+                              "still open). Only useful for debugging -- leaving this on is what causes "
+                              "old-but-still-open requests to freeze at a stale status forever.")
+    parser.add_argument("--stale-refresh-limit", type=int, default=int(os.environ.get("STALE_REFRESH_LIMIT", 300)),
+                         help="Cap on how many stale open requests get re-checked in one run (default 300, or "
+                              "$STALE_REFRESH_LIMIT) -- protects run time against a large backlog; any excess "
+                              "is picked up on a later run.")
     parser.add_argument("--out-dir", default="./dry_run_output")
     args = parser.parse_args()
 
@@ -522,19 +721,31 @@ def main():
     # ---- Step 3 ----
     output_rows = build_output_rows(list_rows, plans)
 
+    # ---- Step 3b (NEW) — re-check stale-but-still-open requests ----
+    # Skipped for --date backfills (single exact day, not the normal
+    # rolling window this step is about) and for --dry-run (it hits
+    # Supabase to find candidates, which a dry run shouldn't depend on).
+    stale_rows = []
+    if not args.date and not args.dry_run and not args.skip_stale_refresh:
+        stale_rows = refresh_stale_open_requests(
+            session, older_than_iso=start_date, today_iso=end_date,
+            already_covered={r["request_number"] for r in output_rows},
+            limit=args.stale_refresh_limit,
+        )
+    all_output_rows = output_rows + stale_rows
+
     if args.dry_run:
         os.makedirs(args.out_dir, exist_ok=True)
         write_csv(os.path.join(args.out_dir, "request_status.csv"), output_rows)
         logging.info(f"DRY RUN complete — review the CSV in {args.out_dir} before running for real.")
     else:
-        sb.upsert(SUPABASE_TABLE, output_rows, on_conflict=SUPABASE_CONFLICT_KEY)
-        logging.info(f"Sync complete — {len(output_rows)} row(s) upserted into '{SUPABASE_TABLE}'.")
+        sb.upsert(SUPABASE_TABLE, all_output_rows, on_conflict=SUPABASE_CONFLICT_KEY)
+        logging.info(f"Sync complete — {len(output_rows)} row(s) from this run's window + "
+                     f"{len(stale_rows)} re-checked stale row(s) upserted into '{SUPABASE_TABLE}'.")
 
     # ---- Step 4 (NEW) — admin-letter response text, additive ----
     if not args.skip_admin_letters:
-        admin_letter_rows = fetch_admin_letters_for_window(
-            session, output_rows, end_date, args.admin_letter_lookback_days
-        )
+        admin_letter_rows = fetch_admin_letters_for_window(session, all_output_rows)
         if args.dry_run:
             write_csv(os.path.join(args.out_dir, "admin_letters.csv"),
                       [{k: v for k, v in r.items() if k != "all_letters"} for r in admin_letter_rows])

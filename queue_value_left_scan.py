@@ -129,7 +129,7 @@ RUNS_TABLE = "decree_daily_scan_runs"
 # write time) so a notice naturally disappears once it ages out, with
 # no separate cleanup/delete job needed.
 ADMIN_LETTER_TABLE = "decree_admin_letter_details"
-DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 10))
+DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 20))
 
 DELAY_BETWEEN_PATIENTS = 0.5
 
@@ -250,8 +250,21 @@ def fetch_patient_admin_letter_notices(patient_id: str, admin_letter_lookback_da
 
     Recency is re-checked HERE (not just at write time in
     request_status_sync.py) against admin_letter_lookback_days (default
-    10, or $ADMIN_LETTER_LOOKBACK_DAYS) so a notice naturally stops
+    20, or $ADMIN_LETTER_LOOKBACK_DAYS) so a notice naturally stops
     showing once it's old news, without a separate cleanup job.
+
+    !! BUG FIX !! This used to compare `request_date` (the request's
+    ORIGINAL SUBMISSION date) against the cutoff -- but "resulted
+    within the last N days" is about when the committee actually
+    DECIDED (committee_date), not when the request was first filed.
+    request_status_sync.py no longer even pre-filters by submission
+    date before fetching (see its BUG FIX #2), so every admin letter
+    this patient has is present in ADMIN_LETTER_TABLE regardless of
+    age -- recency now compares committee_date (parsed to ISO by
+    admin_letter_lookback.get_letter_response -> _extract_committee_date)
+    against the cutoff, falling back to request_date ONLY for the rare
+    row where a committee_date couldn't be parsed at all (better to
+    show a possibly-slightly-stale notice than to silently drop it).
     """
     lookback_days = admin_letter_lookback_days if admin_letter_lookback_days is not None else DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS
     rows = sb.fetch_all(
@@ -263,8 +276,12 @@ def fetch_patient_admin_letter_notices(patient_id: str, admin_letter_lookback_da
         return []
     today_iso = cairo_today_iso()
     cutoff_iso = (datetime.strptime(today_iso, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    recent = [r for r in rows if r.get("request_date") and cutoff_iso <= r["request_date"] <= today_iso]
-    recent.sort(key=lambda r: r.get("request_date") or "", reverse=True)
+
+    def _recency_date(r):
+        return r.get("committee_date") or r.get("request_date")
+
+    recent = [r for r in rows if _recency_date(r) and cutoff_iso <= _recency_date(r) <= today_iso]
+    recent.sort(key=lambda r: _recency_date(r) or "", reverse=True)
     return [
         {
             "request_number": r.get("request_number"),
@@ -279,7 +296,8 @@ def fetch_patient_admin_letter_notices(patient_id: str, admin_letter_lookback_da
 
 
 def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
-                  pending_categories: set, clinic: str = None) -> list:
+                  pending_categories: set, clinic: str = None,
+                  admin_letter_lookback_days: int = None) -> list:
     """Returns the decree_value_left_daily_scan row(s) for one patient.
     `pending_categories` accumulates every raw decree_description this
     run that came back 'pending' from categorize_decree() (needs a
@@ -314,7 +332,7 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
         # docstring): recent admin-letter responses for this patient --
         # shown ALONGSIDE pending_requests, never instead of it, as the
         # last piece of context ("here's what happened last time").
-        "admin_letter_notices": fetch_patient_admin_letter_notices(patient_id),
+        "admin_letter_notices": fetch_patient_admin_letter_notices(patient_id, admin_letter_lookback_days),
     }
 
     if not decrees:
@@ -417,6 +435,10 @@ def main():
     parser.add_argument("--request-id", default=None,
                          help="decree_daily_scan_runs.id (uuid) -- only set when triggered from the app. "
                               "Omit for cron/plain manual runs; every tracking write becomes a no-op.")
+    parser.add_argument("--admin-letter-lookback-days", type=int, default=DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS,
+                         help="Show an admin-letter notice for any letter whose committee_date (falling back "
+                              "to request_date if unparsed) is within this many days of today (default 20, "
+                              "or $ADMIN_LETTER_LOOKBACK_DAYS).")
     args = parser.parse_args()
     request_id = args.request_id
 
@@ -464,7 +486,8 @@ def main():
         logging.info(f"[{idx}/{len(patient_ids)}] scanning patient {pid}...")
         try:
             all_rows.extend(scan_patient(pid, target_iso, session, pending_categories,
-                                         clinic=clinic_by_patient.get(pid)))
+                                         clinic=clinic_by_patient.get(pid),
+                                         admin_letter_lookback_days=args.admin_letter_lookback_days))
         except Exception as e:
             logging.error(f"Failed to scan patient {pid}: {e}")
         time.sleep(DELAY_BETWEEN_PATIENTS)
