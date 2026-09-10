@@ -41,9 +41,9 @@ on:
         default: '15'
 
       admin_letter_lookback_days:
-        description: 'request_status_sync.py: fetch the actual letter response text for any request at an admin-letter status (خطاب ادارى) within the last N days.'
+        description: 'DEPRECATED / no-op — request_status_sync.py now fetches the letter for every admin-letter-status request found each run, unfiltered by date. The real "how many days back counts as recent" control is the ADMIN_LETTER_LOOKBACK_DAYS env var on the decree-value-left-daily-scan.yml workflow instead. Left here only so this input keeps working for anyone still passing it.'
         type: string
-        default: '10'
+        default: '20'
 
 jobs:
   sync:
@@ -129,7 +129,11 @@ jobs:
       # (default last 15 days, not just today -- see the LOOKBACK_DAYS
       # note in request_status_sync.py for why a single-day query used
       # to leave every request's status frozen at its creation-day value
-      # forever). Same second SMC account, single session.
+      # forever). ALSO re-checks any request older than that window that
+      # is still marked open (Step 3b / refresh_stale_open_requests in
+      # request_status_sync.py) so a request doesn't stay frozen forever
+      # just because it's been open longer than --lookback-days. Same
+      # second SMC account, single session.
       # Skipped during a backfill run (see backfill step below instead).
       # -----------------------------------------------------------------
       - name: Run request status sync (refresh last N days of requests)
@@ -141,7 +145,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           LOOKBACK="${{ github.event.inputs.request_status_lookback_days || '15' }}"
-          ADMIN_LETTER_LOOKBACK="${{ github.event.inputs.admin_letter_lookback_days || '10' }}"
+          ADMIN_LETTER_LOOKBACK="${{ github.event.inputs.admin_letter_lookback_days || '20' }}"
           ARGS="--lookback-days $LOOKBACK --admin-letter-lookback-days $ADMIN_LETTER_LOOKBACK"
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"

@@ -23,6 +23,9 @@ on:
       request_id:
         description: "decree_daily_scan_runs.id (uuid) -- set automatically when triggered from the app. Leave blank otherwise."
         required: false
+      admin_letter_lookback_days:
+        description: "Show an admin-letter notice for any letter whose committee_date is within this many days of today. Leave blank for the default (20)."
+        required: false
 
 # Never run two scans at once (e.g. the nightly cron overlapping an
 # app-triggered run): the second one queues and starts when the first
@@ -62,6 +65,13 @@ jobs:
           # never inject shell commands.
           INPUT_DATE: ${{ github.event.inputs.date }}
           INPUT_REQUEST_ID: ${{ github.event.inputs.request_id }}
+          # Drives fetch_patient_admin_letter_notices()'s recency window
+          # (queue_value_left_scan.py reads this env var directly as its
+          # default, and it's also passed explicitly below via
+          # --admin-letter-lookback-days so a manual dispatch override
+          # always wins over the env default).
+          ADMIN_LETTER_LOOKBACK_DAYS: "20"
+          INPUT_ADMIN_LETTER_LOOKBACK_DAYS: ${{ github.event.inputs.admin_letter_lookback_days }}
         run: |
           ARGS=""
           if [ -n "$INPUT_DATE" ]; then
@@ -69,5 +79,8 @@ jobs:
           fi
           if [ -n "$INPUT_REQUEST_ID" ]; then
             ARGS="$ARGS --request-id $INPUT_REQUEST_ID"
+          fi
+          if [ -n "$INPUT_ADMIN_LETTER_LOOKBACK_DAYS" ]; then
+            ARGS="$ARGS --admin-letter-lookback-days $INPUT_ADMIN_LETTER_LOOKBACK_DAYS"
           fi
           python queue_value_left_scan.py $ARGS
