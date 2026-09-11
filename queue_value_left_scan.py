@@ -112,7 +112,9 @@ from hmis_id_resolver import HmisIdResolver
 from patient_decree_value import get_patient_decree_value_details, evaluate_dose_coverage
 from lookup_patient_decree_value import fetch_pending_unsubmitted_value
 from decree_category import categorize_decree, get_category_map
-from admin_letter_lookup import is_admin_letter_status
+from decree_name_map import normalize_request_text
+from admin_letter_lookup import is_admin_letter_status, get_letters_for_request
+import request_status_sync as rss
 from cairo_date import cairo_today_iso
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -120,18 +122,40 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # See "ASSUMPTIONS TO CONFIRM" above.
 DAYCARE_CLINICS = {c for c in ALLOWED_CLINICS if 'day care' in c or 'daycare' in c}
 
+BASE_URL = smc.BASE_URL
+
 RESULTS_TABLE = "decree_value_left_daily_scan"
+# !! NO LONGER READ FROM, ONLY WRITTEN TO (best-effort, write-through) !!
+# These two used to be where fetch_patient_pending_requests() /
+# fetch_patient_admin_letter_notices() got their data FROM -- rows
+# populated by request_status_sync.py's own separate daily batch job,
+# which only re-checks a rolling window each run. Reading them here
+# meant this scan could show a request's status/treatment-plan, or an
+# admin letter's existence, from whenever THAT OTHER job last happened
+# to touch it -- not from right now. Per spec ("no more counting on any
+# extracted decree requests data from any source -- I need it freshly
+# extracted from the website"), this scan now fetches every request and
+# every admin letter LIVE, on the spot, itself (see
+# fetch_patient_requests_live() / fetch_patient_pending_requests() /
+# fetch_patient_admin_letter_notices() below). These two table names are
+# kept only as write-through targets, so decree-renewal.js / needs-review.js
+# (which join against them separately) stay in sync too -- a write
+# failure here is logged and swallowed, it never blocks or changes this
+# scan's own (live-sourced) decision for the current patient.
 REQUEST_STATUS_TABLE = "decree_request_status_daily_export"
-RUNS_TABLE = "decree_daily_scan_runs"
-# NEW — written by request_status_sync.py's Step 4 (see that script for
-# the fetch side). Read-only here: this scan only surfaces what's
-# already there, filtered again by recency at READ time (not just at
-# write time) so a notice naturally disappears once it ages out, with
-# no separate cleanup/delete job needed.
 ADMIN_LETTER_TABLE = "decree_admin_letter_details"
-DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 20))
+RUNS_TABLE = "decree_daily_scan_runs"
+# Per spec: "any patient with an admin letter prior to the day/date/time
+# of extraction by 10 days" -- default is 10, not 20. Still overridable
+# via $ADMIN_LETTER_LOOKBACK_DAYS / --admin-letter-lookback-days for
+# anyone who genuinely wants a wider window.
+DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 10))
 
 DELAY_BETWEEN_PATIENTS = 0.5
+# Between each live SendRequestStatusJson / Details / _PrintLetters GET
+# made per-patient below -- same politeness delay request_status_sync.py
+# uses for the same endpoints.
+DELAY_BETWEEN_REQUESTS = 0.3
 
 # The 4 statuses that mean a request is RESOLVED (final decision either
 # way, cancelled, or converted to an administrative letter) -- exact
@@ -198,7 +222,60 @@ def _is_pending_status(status: Optional[str]) -> bool:
     return status.strip() not in REQUEST_FINAL_STATUSES
 
 
-def fetch_patient_pending_requests(patient_id: str) -> list:
+def fetch_patient_requests_live(session: smc.SMCSession, patient_id: str, today_iso: str = None) -> list:
+    """
+    !! THE fresh-extraction entry point !!
+    A single live hit against /smc/Reports/SendRequestStatusJson,
+    filtered by SsnNumber=patient_id (StartDate pinned far in the past,
+    "2015-01-01", so no request of any age is missed) -- every request
+    this patient has EVER had, with its CURRENT status and submission
+    date, straight off the live site, right now. No Supabase table is
+    read anywhere in this function. Callers (fetch_patient_pending_requests /
+    fetch_patient_admin_letter_notices) both consume THIS SAME result
+    (pass it in as `live_requests` to avoid a redundant second hit per
+    patient) and filter it down for their own purpose. Never raises --
+    returns [] on any HTTP/parse failure so one patient's site hiccup
+    can't take down the whole scan.
+    """
+    today_iso = today_iso or cairo_today_iso()
+    url = f"{BASE_URL}/smc/Reports/SendRequestStatusJson"
+    payload = {
+        'CitizenName': '',
+        'StartDate': rss._smc_datetime_str("2015-01-01"),
+        'EndDate': rss._smc_datetime_str(today_iso, end_of_day=True),
+        'SsnNumber': patient_id,
+        'RequestNumber': '',
+        'RequestStatusId': '',
+        'SystemUserId': '',
+    }
+    try:
+        resp = session.session.post(url, data=payload, timeout=30)
+    except Exception as e:
+        logging.error(f"[live-requests] {patient_id}: SendRequestStatusJson failed ({e})")
+        return []
+    if resp.status_code != 200:
+        logging.warning(f"[live-requests] {patient_id}: SendRequestStatusJson HTTP {resp.status_code}")
+        return []
+    try:
+        raw = resp.json()
+    except ValueError:
+        raw = resp.text
+
+    out = []
+    for rec in rss._parse_send_request_status_json(raw):
+        request_number = rss._clean_id(rec.get('REQUESTID'))
+        if not request_number:
+            continue
+        out.append({
+            "request_number": request_number,
+            "request_status": (rec.get('STATUSARABICNAME') or '').strip() or None,
+            "request_date": rss._parse_dotnet_date(rec.get('REQUESTDATE'), fallback_iso=None),
+        })
+    return out
+
+
+def fetch_patient_pending_requests(session: smc.SMCSession, patient_id: str,
+                                    live_requests: list = None) -> list:
     """
     Returns up to MAX_OPEN_REQUESTS_PER_PATIENT (2) currently-OPEN
     requests for this patient, most recent first, each as a dict:
@@ -206,35 +283,45 @@ def fetch_patient_pending_requests(patient_id: str) -> list:
          request_original_description, request_date}
     or an empty list if the patient has none open right now.
 
-    Fetched ONCE per patient (not per-decree, unlike the old
-    fetch_pending_request_for_patient) since the open-request cap is
-    patient-wide, not tied to any one decree -- see the naming-mismatch
-    caveat in this script's top docstring for why a specific decree
-    can't always be matched to a specific request by name alone.
+    !! FRESH EXTRACTION, NOT A CACHE READ !!
+    This used to read decree_request_status_daily_export -- a table
+    populated by request_status_sync.py's own separate daily batch job
+    (which only re-checks a rolling --lookback-days window each run).
+    That meant a request's status AND its treatment-plan text here
+    could reflect whenever that OTHER job last happened to refresh it,
+    not right now. Every field below instead comes from a live GET/POST
+    made during THIS scan: status+date from `live_requests` (see
+    fetch_patient_requests_live()), and the treatment-plan text from a
+    fresh /smc/Requests/Details/{request_number} GET
+    (request_status_sync.get_treatment_plan) for each of the (at most 2)
+    open requests found -- never from a previous run's saved value.
     """
-    rows = sb.fetch_all(
-        REQUEST_STATUS_TABLE,
-        "request_number,request_status,decree_unique_name,requested_decree_original_description,request_date",
-        filters=f"patient_id=eq.{patient_id}",
-    )
+    rows = live_requests if live_requests is not None else fetch_patient_requests_live(session, patient_id)
     open_rows = [r for r in rows if _is_pending_status(r.get("request_status"))]
     # Most recent request_date first; a missing date sorts last rather
     # than crashing the comparison.
     open_rows.sort(key=lambda r: r.get("request_date") or "", reverse=True)
     open_rows = open_rows[:MAX_OPEN_REQUESTS_PER_PATIENT]
-    return [
-        {
-            "request_number": r.get("request_number"),
+
+    out = []
+    for r in open_rows:
+        request_number = r["request_number"]
+        treatment_plan_text = rss.get_treatment_plan(session, request_number)
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+        unique_name, _action = normalize_request_text((treatment_plan_text or "").strip())
+        out.append({
+            "request_number": request_number,
             "request_status": r.get("request_status"),
-            "request_unique_name": r.get("decree_unique_name"),
-            "request_original_description": r.get("requested_decree_original_description"),
+            "request_unique_name": unique_name,
+            "request_original_description": treatment_plan_text,
             "request_date": r.get("request_date"),
-        }
-        for r in open_rows
-    ]
+        })
+    return out
 
 
-def fetch_patient_admin_letter_notices(patient_id: str, admin_letter_lookback_days: int = None) -> list:
+def fetch_patient_admin_letter_notices(session: smc.SMCSession, patient_id: str,
+                                        admin_letter_lookback_days: int = None,
+                                        live_requests: list = None) -> list:
     """
     ADDITIVE alongside fetch_patient_pending_requests() -- this never
     removes or replaces anything from `pending_requests`. It surfaces a
@@ -248,51 +335,111 @@ def fetch_patient_admin_letter_notices(patient_id: str, admin_letter_lookback_da
     the context a reviewer wants right after seeing "no pending
     request" for a decree that still needs attention.
 
-    Recency is re-checked HERE (not just at write time in
-    request_status_sync.py) against admin_letter_lookback_days (default
-    20, or $ADMIN_LETTER_LOOKBACK_DAYS) so a notice naturally stops
-    showing once it's old news, without a separate cleanup job.
+    !! FRESH EXTRACTION, NOT A CACHE READ !!
+    This used to read decree_admin_letter_details -- a table populated
+    by request_status_sync.py's own separate daily batch pass. Now every
+    admin-letter-status request found in `live_requests` (see
+    fetch_patient_requests_live(), reused here so this doesn't double
+    the SendRequestStatusJson hit already made for
+    fetch_patient_pending_requests()) has its actual letter fetched
+    fresh, right now, via admin_letter_lookup.get_letters_for_request()
+    -- a live GET of the request's Details page + its _PrintLetters
+    popup, never a previously-saved value.
 
-    !! BUG FIX !! This used to compare `request_date` (the request's
-    ORIGINAL SUBMISSION date) against the cutoff -- but "resulted
-    within the last N days" is about when the committee actually
-    DECIDED (committee_date), not when the request was first filed.
-    request_status_sync.py no longer even pre-filters by submission
-    date before fetching (see its BUG FIX #2), so every admin letter
-    this patient has is present in ADMIN_LETTER_TABLE regardless of
-    age -- recency now compares committee_date (parsed to ISO by
-    admin_letter_lookback.get_letter_response -> _extract_committee_date)
-    against the cutoff, falling back to request_date ONLY for the rare
-    row where a committee_date couldn't be parsed at all (better to
-    show a possibly-slightly-stale notice than to silently drop it).
+    Recency: "resulted within the last N days" is about when the
+    committee actually DECIDED (committee_date), not when the request
+    was first filed -- so recency compares committee_date against the
+    cutoff, falling back to request_date ONLY for the rare letter where
+    a committee_date couldn't be parsed at all (better to show a
+    possibly-slightly-stale notice than to silently drop it). The
+    cutoff itself is anchored to Cairo "now" -- the moment THIS scan is
+    running (extraction time) -- not to the patient's appointment date.
+    Default window is 10 days (DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS /
+    $ADMIN_LETTER_LOOKBACK_DAYS / --admin-letter-lookback-days).
     """
     lookback_days = admin_letter_lookback_days if admin_letter_lookback_days is not None else DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS
-    rows = sb.fetch_all(
-        ADMIN_LETTER_TABLE,
-        "request_number,request_date,request_status,treatment_plan,committee_date,response_text",
-        filters=f"patient_id=eq.{patient_id}",
-    )
-    if not rows:
+    rows = live_requests if live_requests is not None else fetch_patient_requests_live(session, patient_id)
+    candidates = [r for r in rows if is_admin_letter_status(r.get("request_status"))]
+    if not candidates:
         return []
+
     today_iso = cairo_today_iso()
     cutoff_iso = (datetime.strptime(today_iso, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
-    def _recency_date(r):
-        return r.get("committee_date") or r.get("request_date")
-
-    recent = [r for r in rows if _recency_date(r) and cutoff_iso <= _recency_date(r) <= today_iso]
-    recent.sort(key=lambda r: _recency_date(r) or "", reverse=True)
-    return [
-        {
-            "request_number": r.get("request_number"),
+    notices = []
+    for r in candidates:
+        request_number = r["request_number"]
+        try:
+            letter_rows = get_letters_for_request(session, request_number, delay=DELAY_BETWEEN_REQUESTS)
+        except Exception as e:
+            logging.error(f"[live-admin-letters] {request_number}: fetch failed, skipping ({e})")
+            continue
+        latest = letter_rows[0] if letter_rows else {}
+        recency_date = latest.get("committee_date") or r.get("request_date")
+        if not recency_date or not (cutoff_iso <= recency_date <= today_iso):
+            continue  # outside the lookback window (or no usable date at all) -- drop it, don't guess
+        treatment_plan_text = rss.get_treatment_plan(session, request_number)
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+        notices.append({
+            "request_number": request_number,
             "request_date": r.get("request_date"),
             "request_status": r.get("request_status"),
-            "treatment_plan": r.get("treatment_plan"),
-            "committee_date": r.get("committee_date"),
-            "response_text": r.get("response_text"),
-        }
-        for r in recent
-    ]
+            "treatment_plan": treatment_plan_text,
+            "committee_date": latest.get("committee_date"),
+            "response_text": latest.get("response_text"),
+        })
+    notices.sort(key=lambda n: n.get("committee_date") or n.get("request_date") or "", reverse=True)
+    return notices
+
+
+def _write_through_request_status(rows: list, patient_id: str) -> None:
+    """Best-effort ONLY -- keeps decree_request_status_daily_export in
+    sync with what THIS scan just found live, for any other consumer
+    (decree-renewal.js etc.) that still reads that table directly. Never
+    raises and never affects this scan's own (already live-sourced)
+    decision for the current patient -- a failure here is logged and
+    swallowed."""
+    if not rows:
+        return
+    try:
+        sb.upsert(
+            REQUEST_STATUS_TABLE,
+            [{
+                "request_number": r["request_number"],
+                "patient_id": patient_id,
+                "request_status": r.get("request_status"),
+                "request_date": r.get("request_date"),
+                "requested_decree_original_description": r.get("request_original_description"),
+                "decree_unique_name": r.get("request_unique_name"),
+            } for r in rows],
+            on_conflict="request_number",
+        )
+    except Exception as e:
+        logging.error(f"[write-through] {REQUEST_STATUS_TABLE} upsert failed (non-fatal): {e}")
+
+
+def _write_through_admin_letters(rows: list, patient_id: str) -> None:
+    """Same best-effort write-through as _write_through_request_status(),
+    for decree_admin_letter_details."""
+    if not rows:
+        return
+    try:
+        sb.upsert(
+            ADMIN_LETTER_TABLE,
+            [{
+                "request_number": r["request_number"],
+                "patient_id": patient_id,
+                "request_date": r.get("request_date"),
+                "request_status": r.get("request_status"),
+                "treatment_plan": r.get("treatment_plan"),
+                "committee_date": r.get("committee_date"),
+                "response_text": r.get("response_text"),
+                "updated_at": _now_iso(),
+            } for r in rows],
+            on_conflict="request_number",
+        )
+    except Exception as e:
+        logging.error(f"[write-through] {ADMIN_LETTER_TABLE} upsert failed (non-fatal): {e}")
 
 
 def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
@@ -312,11 +459,50 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
     # cap (and the fact that a request exists at all) is patient-wide
     # info the app wants to show even for a patient whose decrees all
     # look fine right now.
-    patient_pending = fetch_patient_pending_requests(patient_id)
+    #
+    # Both fetch_patient_pending_requests() and
+    # fetch_patient_admin_letter_notices() need `session` now (they
+    # each do their own live SMC calls) and both are able to reuse a
+    # single SendRequestStatusJson hit instead of each doing their
+    # own -- so that one shared live pull happens HERE, once, and is
+    # handed to both. Skipping this and calling either function with
+    # no `live_requests` would silently double the live hit per
+    # patient (still correct, just twice the load on the site).
+    # Deliberately NOT passing scan_date_iso (the QUEUE/appointment date,
+    # which is tomorrow -- see main()'s date-offset default) as
+    # `today_iso` here. fetch_patient_requests_live()'s `today_iso` is
+    # the EndDate cutoff for "every request up to right now", and the
+    # admin-letter lookback window is explicitly anchored to real
+    # extraction-time "now" (see fetch_patient_admin_letter_notices'
+    # own docstring), not to the patient's future appointment date.
+    # Leaving this unset lets it default to cairo_today_iso() -- actual
+    # wall-clock today in Cairo, at the moment this scan runs.
+    live_requests = fetch_patient_requests_live(session, patient_id)
+
+    patient_pending = fetch_patient_pending_requests(session, patient_id, live_requests=live_requests)
     has_any_pending = len(patient_pending) > 0
     # Kept for anything still reading the old flat scalar columns --
     # the most recent open request, or all-None if there isn't one.
     first_pending = patient_pending[0] if patient_pending else {}
+
+    # NEW, purely additive (see fetch_patient_admin_letter_notices
+    # docstring): recent admin-letter responses for this patient --
+    # shown ALONGSIDE pending_requests, never instead of it, as the
+    # last piece of context ("here's what happened last time").
+    admin_letter_notices = fetch_patient_admin_letter_notices(
+        session, patient_id, admin_letter_lookback_days=admin_letter_lookback_days, live_requests=live_requests
+    )
+
+    # Best-effort write-through so decree-renewal.js / needs-review.js
+    # (which still read decree_request_status_daily_export /
+    # decree_admin_letter_details directly) see today's freshly-scraped
+    # data too, instead of going stale forever now that THIS scan no
+    # longer reads those tables itself. Never affects the row(s)
+    # returned below -- a write-through failure is logged and
+    # swallowed inside each helper, never raised here.
+    _write_through_request_status(patient_pending, patient_id)
+    _write_through_admin_letters(admin_letter_notices, patient_id)
+
     pending_scalar_fields = {
         "has_pending_request": has_any_pending,
         "pending_request_number": first_pending.get("request_number"),
@@ -328,11 +514,7 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
         # which one is "the" pending request. Same list on every row
         # for this patient -- it's patient-level info, not per-decree.
         "pending_requests": patient_pending,
-        # NEW, purely additive (see fetch_patient_admin_letter_notices
-        # docstring): recent admin-letter responses for this patient --
-        # shown ALONGSIDE pending_requests, never instead of it, as the
-        # last piece of context ("here's what happened last time").
-        "admin_letter_notices": fetch_patient_admin_letter_notices(patient_id, admin_letter_lookback_days),
+        "admin_letter_notices": admin_letter_notices,
     }
 
     if not decrees:
