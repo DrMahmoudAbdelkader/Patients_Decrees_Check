@@ -24,7 +24,7 @@ on:
         description: "decree_daily_scan_runs.id (uuid) -- set automatically when triggered from the app. Leave blank otherwise."
         required: false
       admin_letter_lookback_days:
-        description: "Show an admin-letter notice for any letter whose committee_date is within this many days of today. Leave blank for the default (20)."
+        description: "Show an admin-letter notice for any letter whose committee_date is within this many days of today. Leave blank for the default (10)."
         required: false
 
 # Never run two scans at once (e.g. the nightly cron overlapping an
@@ -70,7 +70,17 @@ jobs:
           # default, and it's also passed explicitly below via
           # --admin-letter-lookback-days so a manual dispatch override
           # always wins over the env default).
-          ADMIN_LETTER_LOOKBACK_DAYS: "20"
+          #
+          # !! BUG FIX !! This was hardcoded to "20", which silently
+          # overrode queue_value_left_scan.py's own DEFAULT_ADMIN_LETTER_
+          # LOOKBACK_DAYS=10 (the actual spec: "an admin letter prior to
+          # the day/date/time of extraction by 10 days") on every single
+          # cron run, since an env var always wins over a Python default
+          # when it's set at all -- regardless of what the .py file said.
+          # 10 here now matches the .py default exactly, so a plain
+          # nightly run and a manual dispatch with the input left blank
+          # both actually get the 10-day window the spec asked for.
+          ADMIN_LETTER_LOOKBACK_DAYS: "10"
           INPUT_ADMIN_LETTER_LOOKBACK_DAYS: ${{ github.event.inputs.admin_letter_lookback_days }}
         run: |
           ARGS=""
