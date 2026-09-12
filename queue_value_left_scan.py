@@ -43,25 +43,44 @@ cron behavior is completely unchanged from before this revision.
      "already requested Drug X, status: <status>" from "no request on
      file yet -> needs a new decree request raised."
 
-     REVISION: the site itself caps a patient at 2 concurrently OPEN
-     requests, and a request only counts as "open" while its status
-     is one of the known non-final ones (see REQUEST_FINAL_STATUSES /
-     _is_pending_status below) -- everything else (final decision,
-     administrative letter, cancelled, ...) is resolved and no longer
-     blocks a new request. The previous version fetched with NO status
-     filter at all and kept only the first row Postgres happened to
-     return, so (a) a long-closed request could get shown as "the"
-     pending one instead of a genuinely open one, and (b) a patient
-     with two simultaneously open requests only ever surfaced one of
-     them. fetch_patient_pending_requests() now fetches every request
-     row for the patient ONCE (not per-decree -- the 2-request cap is
-     patient-wide, not decree-specific), filters to the ones that are
-     actually still open, and keeps at most the 2 most recent --
-     matching the site's own limit exactly. The result is written both
-     as the original flat scalar columns (first/most-recent open
-     request, for anything still reading those) AND as a new
-     `pending_requests` jsonb array with up to 2 entries, so the app
-     can show both without guessing which one "the" request is.
+     !! REVISION 2 (2026-09-12, see decree_requests_inspction_mannually.har) !!
+     REVISION above assumed the site caps a patient at 2 concurrently
+     OPEN requests. A manual HAR capture on a real long-treated patient
+     disproved this: that patient had 4 simultaneously open requests
+     (one 'تم التسجيل', three 'لجنة طبية') at once, with no sign of any
+     submission block. There is NO confirmed cap -- fetch_patient_
+     pending_requests() now returns EVERY currently-open request for the
+     patient, not just the 2 most recent. A request only counts as
+     "open" while its status is one of the known non-final ones (see
+     REQUEST_FINAL_STATUSES / _is_pending_status below) -- everything
+     else (final decision, administrative letter, cancelled, ...) is
+     resolved and no longer relevant here. fetch_patient_pending_requests()
+     fetches every request row for the patient ONCE (not per-decree --
+     open-request state is patient-wide, not decree-specific) and
+     filters to the ones that are actually still open. The result is
+     written both as the original flat scalar columns (most-recent open
+     request, for anything still reading those) AND as the
+     `pending_requests` jsonb array (now uncapped), so the app can show
+     the true count without a wrong assumption truncating it.
+
+     That same HAR capture also caught the actual root cause of a
+     separate, more serious bug: this scan's live fetch was built
+     against /smc/Reports/SendRequestStatusJson filtered by SsnNumber=
+     <patient_id> -- an endpoint/filter combination that was never
+     actually verified to work per-patient (request_status_sync.py's
+     own use of it always sends SsnNumber='' and filters client-side
+     afterward). For the captured patient it silently returned nothing
+     at all, even though that patient genuinely had 4 open requests and
+     a recent admin letter sitting right there on the live site --
+     matching exactly the "returns none completely" symptom reported.
+     fetch_patient_requests_live() below now uses
+     POST /smc/Requests/GetRequests + nationalId=<patient_id> instead --
+     the same endpoint the original
+     Extract_All_Decree_Requests_And_Admin_Letters_Unified_Script.py's
+     get_patient_requests_map() already used, confirmed correct against
+     that HAR -- with full pagination (a single heavily-treated patient
+     can have hundreds of historical requests across many pages; the
+     captured example had 250 across 10).
 
   5. Upsert one row per (scan_date, patient_id, decree_number) into
      decree_value_left_daily_scan (decree_number is '' for a patient
@@ -95,6 +114,7 @@ cron behavior is completely unchanged from before this revision.
 """
 
 import os
+import re
 import sys
 import csv
 import time
@@ -102,6 +122,8 @@ import logging
 import argparse
 from typing import Optional
 from datetime import datetime, timedelta, timezone
+
+from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -171,10 +193,12 @@ REQUEST_FINAL_STATUSES = {
     "قرار ملغي",
 }
 
-# The maximum number of concurrently open requests the site itself
-# allows per patient -- once a patient has this many open requests,
-# no new one can be submitted for them until one resolves.
-MAX_OPEN_REQUESTS_PER_PATIENT = 2
+# !! REMOVED (2026-09-12) !! There is no confirmed per-patient cap on
+# concurrently open requests -- see REVISION 2 in the module docstring
+# above. A real patient was found with 4 open at once. Keeping a
+# constant here (even a larger guessed number) would just be a new
+# unverified assumption in place of the old wrong one, so
+# fetch_patient_pending_requests() below no longer truncates at all.
 
 
 def _now_iso():
@@ -222,66 +246,139 @@ def _is_pending_status(status: Optional[str]) -> bool:
     return status.strip() not in REQUEST_FINAL_STATUSES
 
 
+_PAGE_OF_RE = re.compile(r'Page\s+\d+\s+of\s+(\d+)')
+
+
+def _parse_get_requests_page(html_text: str) -> tuple:
+    """Parses one page of /smc/Requests/GetRequests's HTML response
+    (table id="requestTable", columns: رقم الطلب | الرقم القومى للمريض |
+    تاريخ الطلب | اسم المواطن | جهة الإرسال | جهة العلاج | مرحلة الطلب |
+    عمليات -- confirmed against decree_requests_inspction_mannually.har).
+    Returns (rows, total_pages). Each row is
+    {request_number, request_status, request_date} -- request_date here
+    is already a plain 'YYYY-MM-DD' string straight out of the page, no
+    /Date(...)/ epoch-ms parsing needed (unlike SendRequestStatusJson).
+    total_pages comes from the "Page X of Y" text in the #myPager div;
+    defaults to 1 if that div isn't found (e.g. a patient with only one
+    page of history has no pager at all)."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    rows = []
+    table = soup.find("table", id="requestTable")
+    if table:
+        for tr in table.find_all("tr"):
+            cells = tr.find_all("td")
+            if len(cells) < 7:
+                continue  # header row, or a stray row with no data
+            link = cells[0].find("a")
+            request_number = (link.get_text(strip=True) if link else cells[0].get_text(strip=True)).strip()
+            if not request_number.isdigit():
+                continue
+            rows.append({
+                "request_number": request_number,
+                "request_status": cells[6].get_text(strip=True) or None,
+                "request_date": cells[2].get_text(strip=True) or None,
+            })
+    total_pages = 1
+    pager = soup.find(id="myPager")
+    if pager:
+        m = _PAGE_OF_RE.search(pager.get_text())
+        if m:
+            total_pages = int(m.group(1))
+    return rows, total_pages
+
+
 def fetch_patient_requests_live(session: smc.SMCSession, patient_id: str, today_iso: str = None) -> list:
     """
     !! THE fresh-extraction entry point !!
-    A single live hit against /smc/Reports/SendRequestStatusJson,
-    filtered by SsnNumber=patient_id (StartDate pinned far in the past,
-    "2015-01-01", so no request of any age is missed) -- every request
-    this patient has EVER had, with its CURRENT status and submission
-    date, straight off the live site, right now. No Supabase table is
-    read anywhere in this function. Callers (fetch_patient_pending_requests /
-    fetch_patient_admin_letter_notices) both consume THIS SAME result
-    (pass it in as `live_requests` to avoid a redundant second hit per
-    patient) and filter it down for their own purpose. Never raises --
-    returns [] on any HTTP/parse failure so one patient's site hiccup
-    can't take down the whole scan.
-    """
-    today_iso = today_iso or cairo_today_iso()
-    url = f"{BASE_URL}/smc/Reports/SendRequestStatusJson"
-    payload = {
-        'CitizenName': '',
-        'StartDate': rss._smc_datetime_str("2015-01-01"),
-        'EndDate': rss._smc_datetime_str(today_iso, end_of_day=True),
-        'SsnNumber': patient_id,
-        'RequestNumber': '',
-        'RequestStatusId': '',
-        'SystemUserId': '',
-    }
-    try:
-        resp = session.session.post(url, data=payload, timeout=30)
-    except Exception as e:
-        logging.error(f"[live-requests] {patient_id}: SendRequestStatusJson failed ({e})")
-        return []
-    if resp.status_code != 200:
-        logging.warning(f"[live-requests] {patient_id}: SendRequestStatusJson HTTP {resp.status_code}")
-        return []
-    try:
-        raw = resp.json()
-    except ValueError:
-        raw = resp.text
+    !! ENDPOINT FIX (2026-09-12, see decree_requests_inspction_mannually.har) !!
+    This used to POST /smc/Reports/SendRequestStatusJson filtered by
+    SsnNumber=patient_id. A manual HAR capture on a real patient with 4
+    genuinely open requests + a recent admin letter proved that call
+    comes back completely empty for a per-patient SsnNumber filter --
+    request_status_sync.py's own use of this same endpoint always sends
+    SsnNumber='' and filters client-side afterward, so the per-SSN
+    server-side filter was never actually verified to work at all. This
+    was the root cause of "returns none completely" for a patient who
+    plainly has live data.
 
+    Switched to POST /smc/Requests/GetRequests + nationalId=patient_id --
+    the exact endpoint
+    Extract_All_Decree_Requests_And_Admin_Letters_Unified_Script.py's
+    get_patient_requests_map() already used, confirmed correct against
+    the same HAR (15 rows on page 1 alone for that patient, statuses and
+    dates matching a manual check exactly). fromDate/toDate are still
+    sent (the endpoint requires them) but pinned wide open
+    ("01-01-2015".."today") rather than trusted as a real filter -- the
+    captured request's own fromDate/toDate only spanned two days yet
+    still returned requests dated back to May 2026, confirming (same as
+    DecreesSearch-by-decreeID in hospital_decrees_sync.py) that the date
+    range stops being a meaningful filter once a specific national ID is
+    set.
+
+    !! PAGINATION (also new) !! The captured patient had 250 requests
+    across 10 pages -- a single-page read (which is all the reference
+    script or the old JSON call ever did) would silently miss most of a
+    long-treated patient's history, open requests included if any of
+    them happen to sit past page 1. This walks every page via the same
+    "Page X of Y" pattern already used elsewhere in this codebase (see
+    hospital_decrees_sync._parse_decree_table_page), stopping once every
+    page is read or a page comes back with zero rows.
+
+    Never raises -- returns whatever pages were read successfully so
+    far on any HTTP/parse failure partway through, rather than losing
+    everything already fetched for one bad page.
+    """
+    url = f"{BASE_URL}/smc/Requests/GetRequests"
+    base_payload = {
+        "requestId": "", "nationalId": patient_id, "REQUESTIMPORTANCEID": "",
+        "TreatmentProcdId": "", "patientName": "",
+        "fromDate": "01-01-2015", "toDate": datetime.now().strftime("%m-%d-%Y"),
+        "recommendHosId": "", "statusId": "", "cancerCase": "false",
+        "source": "", "page": "1",
+    }
     out = []
-    for rec in rss._parse_send_request_status_json(raw):
-        request_number = rss._clean_id(rec.get('REQUESTID'))
-        if not request_number:
-            continue
-        out.append({
-            "request_number": request_number,
-            "request_status": (rec.get('STATUSARABICNAME') or '').strip() or None,
-            "request_date": rss._parse_dotnet_date(rec.get('REQUESTDATE'), fallback_iso=None),
-        })
+    page = 1
+    total_pages = None
+    while True:
+        payload = dict(base_payload, page=str(page))
+        try:
+            resp = session.session.post(
+                url, data=payload, timeout=30,
+                headers={"Referer": f"{BASE_URL}/smc/Requests"},
+            )
+        except Exception as e:
+            logging.error(f"[live-requests] {patient_id}: GetRequests page {page} failed ({e})")
+            break
+        if resp.status_code != 200:
+            logging.warning(f"[live-requests] {patient_id}: GetRequests page {page} HTTP {resp.status_code}")
+            break
+        rows, page_total_pages = _parse_get_requests_page(resp.text)
+        if page == 1:
+            total_pages = page_total_pages
+        if not rows:
+            break
+        out.extend(rows)
+        if total_pages and page >= total_pages:
+            break
+        page += 1
+        time.sleep(DELAY_BETWEEN_REQUESTS)
     return out
 
 
 def fetch_patient_pending_requests(session: smc.SMCSession, patient_id: str,
                                     live_requests: list = None) -> list:
     """
-    Returns up to MAX_OPEN_REQUESTS_PER_PATIENT (2) currently-OPEN
-    requests for this patient, most recent first, each as a dict:
+    Returns EVERY currently-OPEN request for this patient, most recent
+    first, each as a dict:
         {request_number, request_status, request_unique_name,
          request_original_description, request_date}
     or an empty list if the patient has none open right now.
+
+    !! NO LONGER CAPPED AT 2 (2026-09-12) !! See REVISION 2 in the
+    module docstring: a real patient was found with 4 simultaneously
+    open requests, disproving the earlier "site caps at 2" assumption.
+    There's no substitute cap here either -- guessing a new number would
+    just be a new unverified assumption.
 
     !! FRESH EXTRACTION, NOT A CACHE READ !!
     This used to read decree_request_status_daily_export -- a table
@@ -293,15 +390,14 @@ def fetch_patient_pending_requests(session: smc.SMCSession, patient_id: str,
     made during THIS scan: status+date from `live_requests` (see
     fetch_patient_requests_live()), and the treatment-plan text from a
     fresh /smc/Requests/Details/{request_number} GET
-    (request_status_sync.get_treatment_plan) for each of the (at most 2)
-    open requests found -- never from a previous run's saved value.
+    (request_status_sync.get_treatment_plan) for each open request
+    found -- never from a previous run's saved value.
     """
     rows = live_requests if live_requests is not None else fetch_patient_requests_live(session, patient_id)
     open_rows = [r for r in rows if _is_pending_status(r.get("request_status"))]
     # Most recent request_date first; a missing date sorts last rather
     # than crashing the comparison.
     open_rows.sort(key=lambda r: r.get("request_date") or "", reverse=True)
-    open_rows = open_rows[:MAX_OPEN_REQUESTS_PER_PATIENT]
 
     out = []
     for r in open_rows:
@@ -509,10 +605,12 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
         "pending_request_status": first_pending.get("request_status"),
         "pending_request_treatment_plan": first_pending.get("request_unique_name"),
         "pending_request_original_description": first_pending.get("request_original_description"),
-        # New: the full (up to 2) list of currently open requests for
-        # this patient, so the app can show BOTH instead of guessing
-        # which one is "the" pending request. Same list on every row
-        # for this patient -- it's patient-level info, not per-decree.
+        # Full list of every currently open request for this patient
+        # (no longer capped at 2 -- see REVISION 2 in the module
+        # docstring), so the app can show all of them instead of
+        # guessing which one is "the" pending request. Same list on
+        # every row for this patient -- it's patient-level info, not
+        # per-decree.
         "pending_requests": patient_pending,
         "admin_letter_notices": admin_letter_notices,
     }
@@ -619,7 +717,7 @@ def main():
                               "Omit for cron/plain manual runs; every tracking write becomes a no-op.")
     parser.add_argument("--admin-letter-lookback-days", type=int, default=DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS,
                          help="Show an admin-letter notice for any letter whose committee_date (falling back "
-                              "to request_date if unparsed) is within this many days of today (default 20, "
+                              "to request_date if unparsed) is within this many days of today (default 10, "
                               "or $ADMIN_LETTER_LOOKBACK_DAYS).")
     args = parser.parse_args()
     request_id = args.request_id
