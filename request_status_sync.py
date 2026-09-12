@@ -135,7 +135,14 @@ DEFAULT_LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", 15))
 # alongside/after it. See fetch_admin_letters_for_window() below and
 # ADMIN_LETTER_TABLE / decree_admin_letter_details.
 ADMIN_LETTER_TABLE = "decree_admin_letter_details"
-DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 20))
+# Kept in sync with queue_value_left_scan.DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS
+# (10 -- per spec: "an admin letter prior to the day/date/time of
+# extraction by 10 days") even though this value is currently unused for
+# any actual filtering in THIS script (see BUG FIX #2 below) -- both ends
+# read the same $ADMIN_LETTER_LOOKBACK_DAYS env var and should agree on
+# the same fallback if that env var is ever unset in one place but not
+# the other.
+DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 10))
 
 # !! BUG FIX #2 (the actual reason "recent" admin letters kept going
 # missing) !!
@@ -662,7 +669,7 @@ def main():
                               "with no submission-date pre-filter (see BUG FIX #2 near ADMIN_LETTER_TABLE). "
                               "The 'is this recent' decision moved to read time in "
                               "queue_value_left_scan.fetch_patient_admin_letter_notices(), which is where "
-                              "this same value (default 20, or $ADMIN_LETTER_LOOKBACK_DAYS) actually matters "
+                              "this same value (default 10, or $ADMIN_LETTER_LOOKBACK_DAYS) actually matters "
                               "now. Kept here only so existing callers/workflows passing this flag don't break.")
     parser.add_argument("--skip-admin-letters", action="store_true",
                          help="Skip the admin-letter response-text fetch entirely (just the status sync).")
