@@ -51,10 +51,12 @@ cron behavior is completely unchanged from before this revision.
      submission block. There is NO confirmed cap -- fetch_patient_
      pending_requests() now returns EVERY currently-open request for the
      patient, not just the 2 most recent. A request only counts as
-     "open" while its status is one of the known non-final ones (see
-     REQUEST_FINAL_STATUSES / _is_pending_status below) -- everything
-     else (final decision, administrative letter, cancelled, ...) is
-     resolved and no longer relevant here. fetch_patient_pending_requests()
+     "open" if its status is an EXACT match for one of the 8 known
+     pending statuses (PENDING_REQUEST_STATUSES / _is_pending_status
+     below) -- this used to be the inverse (everything not explicitly
+     final counted as open), which let unrecognized/uncatalogued status
+     text on old, actually-resolved requests leak through as false
+     positives. fetch_patient_pending_requests()
      fetches every request row for the patient ONCE (not per-decree --
      open-request state is patient-wide, not decree-specific) and
      filters to the ones that are actually still open. The result is
@@ -173,25 +175,66 @@ RUNS_TABLE = "decree_daily_scan_runs"
 # anyone who genuinely wants a wider window.
 DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS = int(os.environ.get("ADMIN_LETTER_LOOKBACK_DAYS", 10))
 
+# How far back fetch_patient_requests_live() walks a patient's paginated
+# request history before assuming "nothing pending further back either"
+# and stopping early (see that function's own docstring for the
+# early-stop mechanics and the assumption behind it). Separate from
+# ADMIN_LETTER_LOOKBACK_DAYS above -- that one's about admin-letter
+# RECENCY (how old a resulted letter can be and still be worth
+# surfacing), this one's about how far back to even look for a pending
+# request at all. Must stay >= ADMIN_LETTER_LOOKBACK_DAYS since
+# fetch_patient_admin_letter_notices() reuses the same live_requests
+# list -- default 30 comfortably covers the default 10-day admin-letter
+# window.
+DEFAULT_REQUEST_LOOKBACK_DAYS = int(os.environ.get("REQUEST_LOOKBACK_DAYS", 30))
+
 DELAY_BETWEEN_PATIENTS = 0.5
 # Between each live SendRequestStatusJson / Details / _PrintLetters GET
 # made per-patient below -- same politeness delay request_status_sync.py
 # uses for the same endpoints.
 DELAY_BETWEEN_REQUESTS = 0.3
 
-# The 4 statuses that mean a request is RESOLVED (final decision either
-# way, cancelled, or converted to an administrative letter) -- exact
-# text as it comes back from the site. Everything else -- including any
-# status text not in this list, e.g. a new one the site adds later --
-# is treated as still OPEN (see _is_pending_status). That's
-# deliberately the conservative direction: an unrecognized status
-# should never silently hide a request that might still be active.
+# !! BUG FIX (2026-09-12) !! This used to be a BLACKLIST
+# (REQUEST_FINAL_STATUSES): "anything NOT one of these 4 exact final
+# strings counts as still open." That was deliberately conservative,
+# but it backfired in practice -- any status text that isn't an exact
+# match for one of the 4 (a rarer/older status like "قرار ملغى
+# للتعديل", or any other wording the site uses that was never
+# catalogued here) silently falls through as "still pending", which is
+# how years-old, long-resolved decree requests were leaking into the
+# pending-requests output alongside genuinely open ones.
+#
+# Switched to a WHITELIST instead: a request only counts as pending if
+# its status is an EXACT match for one of these 8 known pending
+# statuses (your list). Anything else -- including any status not
+# recognized at all -- is treated as resolved/not-pending, and logged
+# once per distinct unrecognized value so a genuinely new status added
+# by the site later is visible in the logs rather than silently
+# mis-classified either way.
+PENDING_REQUEST_STATUSES = {
+    "تأجيل الطلب لإرفاق ملف الأشعة",
+    "محول إلى طبيب آخر",
+    "تم فحصه فى لجنة طبية",
+    "توصية نهائية",
+    "توصية مبدئية",
+    "توصية مع عرض لجنة",
+    "لجنة طبية",
+    "تم التسجيل",
+}
+
+# Kept only for reference/back-compat with anything that might still
+# import it -- no longer read by _is_pending_status (see above).
 REQUEST_FINAL_STATUSES = {
     "قرار نهائى",
     "خطاب ادارى",
     "إلغاء بناءاً على طلب المريض أو مندوب المستشفي",
     "قرار ملغي",
 }
+
+# Tracks which unrecognized status strings we've already logged this
+# run, so a common-but-uncatalogued status doesn't spam the log once
+# per request -- just once per distinct value.
+_UNRECOGNIZED_STATUSES_SEEN = set()
 
 # !! REMOVED (2026-09-12) !! There is no confirmed per-patient cap on
 # concurrently open requests -- see REVISION 2 in the module docstring
@@ -201,8 +244,32 @@ REQUEST_FINAL_STATUSES = {
 # fetch_patient_pending_requests() below no longer truncates at all.
 
 
+
 def _now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# !! BUG FIX (2026-09-12) !! mark_run("done", ...) is main()'s LAST
+# statement, called after every real result (the scan itself, the
+# decree_value_left_daily_scan upsert) has already succeeded and been
+# logged. Before this fix, a single transient Supabase 504 on THIS
+# call alone (sb.patch() raises RuntimeError on any non-2xx response)
+# propagated straight out of main() and killed the whole process with
+# exit code 1 -- making GitHub Actions report a "failed" run, and
+# leaving decree_daily_scan_runs stuck at whatever status it was
+# already in (never flipped to "done"), even though every row of real
+# data was already safely saved. 504s from PostgREST/Supabase are
+# common under load (this same run logged 3 other transient 504s
+# earlier, on write-throughs that already have their own try/except)
+# and are usually gone on an immediate retry, so:
+#   1. Retry the PATCH a few times with a short backoff before giving
+#      up, same idea as the other Supabase calls in this file.
+#   2. Never let a failure here raise out of mark_run() at all -- log
+#      it and return, so a status-flip failure can never turn an
+#      otherwise-successful run into a reported failure, and can never
+#      mask whatever real error message was being reported.
+_MARK_RUN_RETRIES = 3
+_MARK_RUN_RETRY_DELAY = 5  # seconds, doubled each attempt
 
 
 def mark_run(request_id, status, error_message=None, scan_date_iso=None,
@@ -212,6 +279,13 @@ def mark_run(request_id, status, error_message=None, scan_date_iso=None,
     A no-op whenever request_id is falsy -- i.e. every cron/plain
     manual-dispatch run, which never passes --request-id and so never
     touches this table at all.
+
+    !! NEVER RAISES !! (see BUG FIX note above) -- a transient
+    Supabase error here must never crash the caller or turn an
+    otherwise-successful scan into a reported failure. Retries a few
+    times first; if every attempt fails, logs it clearly (including
+    what status this run should have ended up at, for manual
+    cleanup) and returns rather than propagating.
     """
     if not request_id:
         return
@@ -224,7 +298,29 @@ def mark_run(request_id, status, error_message=None, scan_date_iso=None,
         body["row_count"] = row_count
     if flagged_count is not None:
         body["flagged_count"] = flagged_count
-    sb.patch(RUNS_TABLE, f"id=eq.{request_id}", body)
+
+    delay = _MARK_RUN_RETRY_DELAY
+    for attempt in range(1, _MARK_RUN_RETRIES + 1):
+        try:
+            sb.patch(RUNS_TABLE, f"id=eq.{request_id}", body)
+            return
+        except Exception as e:
+            if attempt < _MARK_RUN_RETRIES:
+                logging.warning(
+                    f"[{RUNS_TABLE}] patch to '{status}' failed on attempt "
+                    f"{attempt}/{_MARK_RUN_RETRIES} ({e}) -- retrying in {delay}s."
+                )
+                time.sleep(delay)
+                delay *= 2
+            else:
+                logging.error(
+                    f"[{RUNS_TABLE}] patch to '{status}' failed after "
+                    f"{_MARK_RUN_RETRIES} attempts ({e}) -- request_id={request_id} "
+                    f"is stuck at its previous status. The underlying scan data "
+                    f"itself is unaffected (this only updates the tracking row); "
+                    f"check decree_daily_scan_runs manually if the app's poll "
+                    f"loop is now stuck waiting for '{status}'."
+                )
 
 
 def build_daycare_queue_rows(raw_records: list, appointment_date_iso: str,
@@ -237,13 +333,35 @@ def build_daycare_queue_rows(raw_records: list, appointment_date_iso: str,
 
 
 def _is_pending_status(status: Optional[str]) -> bool:
-    """A request counts as still OPEN unless its status is one of the
-    known final ones. None/blank status (shouldn't normally happen,
-    but data can be messy) is also treated as open -- conservative on
-    purpose, see REQUEST_FINAL_STATUSES above."""
+    """A request counts as OPEN only if its status is an EXACT match
+    for one of PENDING_REQUEST_STATUSES (see the BUG FIX note above --
+    this used to be the inverse: everything not explicitly final was
+    treated as open, which let unusual/uncatalogued statuses on old
+    requests leak through as false positives).
+
+    None/blank status is NOT treated as pending anymore either --
+    blank status has never actually meant "still active" in real data,
+    it just means we don't know, and guessing "open" was part of the
+    same over-inclusive assumption this fix removes.
+
+    Any non-blank status that's neither in PENDING_REQUEST_STATUSES nor
+    REQUEST_FINAL_STATUSES is logged once (not once per request) so an
+    actually-new status the site starts using is visible in the logs
+    instead of being silently mis-classified in either direction."""
     if not status:
+        return False
+    status = status.strip()
+    if status in PENDING_REQUEST_STATUSES:
         return True
-    return status.strip() not in REQUEST_FINAL_STATUSES
+    if status not in REQUEST_FINAL_STATUSES and status not in _UNRECOGNIZED_STATUSES_SEEN:
+        _UNRECOGNIZED_STATUSES_SEEN.add(status)
+        logging.warning(
+            f"[pending-status] unrecognized request status {status!r} -- "
+            f"not in PENDING_REQUEST_STATUSES or REQUEST_FINAL_STATUSES, "
+            f"treating as NOT pending. Add it to one of those two sets in "
+            f"queue_value_left_scan.py if this is a real status the site uses."
+        )
+    return False
 
 
 _PAGE_OF_RE = re.compile(r'Page\s+\d+\s+of\s+(\d+)')
@@ -287,7 +405,8 @@ def _parse_get_requests_page(html_text: str) -> tuple:
     return rows, total_pages
 
 
-def fetch_patient_requests_live(session: smc.SMCSession, patient_id: str, today_iso: str = None) -> list:
+def fetch_patient_requests_live(session: smc.SMCSession, patient_id: str, today_iso: str = None,
+                                 lookback_days: int = None) -> list:
     """
     !! THE fresh-extraction entry point !!
     !! ENDPOINT FIX (2026-09-12, see decree_requests_inspction_mannually.har) !!
@@ -307,32 +426,52 @@ def fetch_patient_requests_live(session: smc.SMCSession, patient_id: str, today_
     get_patient_requests_map() already used, confirmed correct against
     the same HAR (15 rows on page 1 alone for that patient, statuses and
     dates matching a manual check exactly). fromDate/toDate are still
-    sent (the endpoint requires them) but pinned wide open
-    ("01-01-2015".."today") rather than trusted as a real filter -- the
+    sent (the endpoint requires them) but pinned wide open on the
+    request itself -- confirmed (same as DecreesSearch-by-decreeID in
+    hospital_decrees_sync.py) that the site does NOT actually apply
+    fromDate/toDate server-side once a specific nationalId is set (the
     captured request's own fromDate/toDate only spanned two days yet
-    still returned requests dated back to May 2026, confirming (same as
-    DecreesSearch-by-decreeID in hospital_decrees_sync.py) that the date
-    range stops being a meaningful filter once a specific national ID is
-    set.
+    still returned requests dated back to May 2026), so those two
+    values can't be used to make the SITE do less work -- only to make
+    THIS function stop asking for more pages once it has enough.
 
-    !! PAGINATION (also new) !! The captured patient had 250 requests
-    across 10 pages -- a single-page read (which is all the reference
-    script or the old JSON call ever did) would silently miss most of a
-    long-treated patient's history, open requests included if any of
-    them happen to sit past page 1. This walks every page via the same
-    "Page X of Y" pattern already used elsewhere in this codebase (see
-    hospital_decrees_sync._parse_decree_table_page), stopping once every
-    page is read or a page comes back with zero rows.
+    !! LOOKBACK WINDOW / EARLY STOP (2026-09-12, for speed) !!
+    A pending-status request is only ever meaningful if it's recent --
+    per spec, if nothing pending turns up within the last
+    lookback_days (default DEFAULT_REQUEST_LOOKBACK_DAYS / 30, see
+    $REQUEST_LOOKBACK_DAYS / --request-lookback-days), there's nothing
+    pending at all, full stop -- so this no longer needs to walk a
+    heavily-treated patient's entire history (the captured example had
+    250 requests across 10 pages). The site returns each page already
+    sorted newest-request-first (confirmed against the HAR), so this
+    walks pages in order and stops -- WITHOUT fetching any further
+    pages -- the instant it sees a row older than the cutoff, since
+    every row after that point (rest of the current page, and every
+    later page) is guaranteed to be even older. Rows with no parseable
+    date are kept rather than used to decide the cutoff, same
+    conservative-on-missing-data approach used elsewhere in this file.
+
+    !! ASSUMPTION TO CONFIRM !! This assumes a request's status never
+    sits at one of PENDING_REQUEST_STATUSES for longer than
+    lookback_days after it was filed. If SMC ever has a real backlog
+    where a request stays open past that window, this would miss it --
+    widen --request-lookback-days (or $REQUEST_LOOKBACK_DAYS) if that
+    turns out to happen in practice.
 
     Never raises -- returns whatever pages were read successfully so
     far on any HTTP/parse failure partway through, rather than losing
     everything already fetched for one bad page.
     """
+    if today_iso is None:
+        today_iso = cairo_today_iso()
+    lookback_days = lookback_days if lookback_days is not None else DEFAULT_REQUEST_LOOKBACK_DAYS
+    cutoff_iso = (datetime.strptime(today_iso, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
     url = f"{BASE_URL}/smc/Requests/GetRequests"
     base_payload = {
         "requestId": "", "nationalId": patient_id, "REQUESTIMPORTANCEID": "",
         "TreatmentProcdId": "", "patientName": "",
-        "fromDate": "01-01-2015", "toDate": datetime.now().strftime("%m-%d-%Y"),
+        "fromDate": "01-01-2015", "toDate": datetime.strptime(today_iso, "%Y-%m-%d").strftime("%m-%d-%Y"),
         "recommendHosId": "", "statusId": "", "cancerCase": "false",
         "source": "", "page": "1",
     }
@@ -357,7 +496,23 @@ def fetch_patient_requests_live(session: smc.SMCSession, patient_id: str, today_
             total_pages = page_total_pages
         if not rows:
             break
-        out.extend(rows)
+
+        hit_cutoff = False
+        for r in rows:
+            rdate = r.get("request_date")
+            if rdate and rdate < cutoff_iso:
+                hit_cutoff = True
+                break  # this row and everything after it (rest of this
+                       # page, every later page) is older -- stop here
+            out.append(r)
+        if hit_cutoff:
+            logging.info(
+                f"[live-requests] {patient_id}: hit {lookback_days}-day cutoff "
+                f"({cutoff_iso}) on page {page}/{total_pages} -- stopping early "
+                f"({len(out)} row(s) kept)."
+            )
+            break
+
         if total_pages and page >= total_pages:
             break
         page += 1
@@ -423,10 +578,11 @@ def fetch_patient_admin_letter_notices(session: smc.SMCSession, patient_id: str,
     removes or replaces anything from `pending_requests`. It surfaces a
     SEPARATE signal: any request that recently came back as an
     administrative letter (خطاب ادارى / خطاب إداري -- usually a decline
-    or redirect rather than a granted decree) is, per
-    queue_value_left_scan.REQUEST_FINAL_STATUSES, already treated as a
-    RESOLVED/closed request and so never appears in the pending list at
-    all -- which is correct for "is a NEW request needed", but silently
+    or redirect rather than a granted decree) is not one of
+    queue_value_left_scan.PENDING_REQUEST_STATUSES, so it's already
+    treated as a RESOLVED/closed request and so never appears in the
+    pending list at all -- which is correct for "is a NEW request
+    needed", but silently
     drops the fact that a request WAS just declined, which is exactly
     the context a reviewer wants right after seeing "no pending
     request" for a decree that still needs attention.
@@ -540,7 +696,8 @@ def _write_through_admin_letters(rows: list, patient_id: str) -> None:
 
 def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
                   pending_categories: set, clinic: str = None,
-                  admin_letter_lookback_days: int = None) -> list:
+                  admin_letter_lookback_days: int = None,
+                  request_lookback_days: int = None) -> list:
     """Returns the decree_value_left_daily_scan row(s) for one patient.
     `pending_categories` accumulates every raw decree_description this
     run that came back 'pending' from categorize_decree() (needs a
@@ -573,7 +730,24 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
     # own docstring), not to the patient's future appointment date.
     # Leaving this unset lets it default to cairo_today_iso() -- actual
     # wall-clock today in Cairo, at the moment this scan runs.
-    live_requests = fetch_patient_requests_live(session, patient_id)
+    #
+    # !! (2026-09-12) !! The one shared pull now stops early past
+    # request_lookback_days (see fetch_patient_requests_live's own
+    # docstring) -- so it must use whichever window is WIDER of the
+    # two callers' needs, or a longer --admin-letter-lookback-days
+    # override could ask fetch_patient_admin_letter_notices() to look
+    # for letters further back than this shared pull actually fetched,
+    # silently truncating it instead of widening it.
+    effective_admin_letter_lookback = (
+        admin_letter_lookback_days if admin_letter_lookback_days is not None else DEFAULT_ADMIN_LETTER_LOOKBACK_DAYS
+    )
+    effective_request_lookback = (
+        request_lookback_days if request_lookback_days is not None else DEFAULT_REQUEST_LOOKBACK_DAYS
+    )
+    live_requests = fetch_patient_requests_live(
+        session, patient_id,
+        lookback_days=max(effective_request_lookback, effective_admin_letter_lookback),
+    )
 
     patient_pending = fetch_patient_pending_requests(session, patient_id, live_requests=live_requests)
     has_any_pending = len(patient_pending) > 0
@@ -719,6 +893,11 @@ def main():
                          help="Show an admin-letter notice for any letter whose committee_date (falling back "
                               "to request_date if unparsed) is within this many days of today (default 10, "
                               "or $ADMIN_LETTER_LOOKBACK_DAYS).")
+    parser.add_argument("--request-lookback-days", type=int, default=DEFAULT_REQUEST_LOOKBACK_DAYS,
+                         help="Stop walking a patient's paginated request history once every request found "
+                              "so far is older than this many days (default 30, or $REQUEST_LOOKBACK_DAYS) -- "
+                              "a pending-status request outside this window is assumed not to exist, for "
+                              "speed on long-treated patients with hundreds of historical requests.")
     args = parser.parse_args()
     request_id = args.request_id
 
@@ -767,7 +946,8 @@ def main():
         try:
             all_rows.extend(scan_patient(pid, target_iso, session, pending_categories,
                                          clinic=clinic_by_patient.get(pid),
-                                         admin_letter_lookback_days=args.admin_letter_lookback_days))
+                                         admin_letter_lookback_days=args.admin_letter_lookback_days,
+                                         request_lookback_days=args.request_lookback_days))
         except Exception as e:
             logging.error(f"Failed to scan patient {pid}: {e}")
         time.sleep(DELAY_BETWEEN_PATIENTS)
