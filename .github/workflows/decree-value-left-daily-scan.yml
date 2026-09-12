@@ -26,6 +26,9 @@ on:
       admin_letter_lookback_days:
         description: "Show an admin-letter notice for any letter whose committee_date is within this many days of today. Leave blank for the default (10)."
         required: false
+      request_lookback_days:
+        description: "Stop scanning a patient's request history once every request found is older than this many days (speed optimization -- a pending request outside this window is assumed not to exist). Leave blank for the default (30)."
+        required: false
 
 # Never run two scans at once (e.g. the nightly cron overlapping an
 # app-triggered run): the second one queues and starts when the first
@@ -82,6 +85,14 @@ jobs:
           # both actually get the 10-day window the spec asked for.
           ADMIN_LETTER_LOOKBACK_DAYS: "10"
           INPUT_ADMIN_LETTER_LOOKBACK_DAYS: ${{ github.event.inputs.admin_letter_lookback_days }}
+          # Drives fetch_patient_requests_live()'s early-stop pagination
+          # window (see queue_value_left_scan.py's DEFAULT_REQUEST_
+          # LOOKBACK_DAYS) -- how far back to look for a pending
+          # request before assuming there isn't one. 30 matches the
+          # .py default; --request-lookback-days below always wins if
+          # a manual dispatch sets it.
+          REQUEST_LOOKBACK_DAYS: "30"
+          INPUT_REQUEST_LOOKBACK_DAYS: ${{ github.event.inputs.request_lookback_days }}
         run: |
           ARGS=""
           if [ -n "$INPUT_DATE" ]; then
@@ -92,5 +103,8 @@ jobs:
           fi
           if [ -n "$INPUT_ADMIN_LETTER_LOOKBACK_DAYS" ]; then
             ARGS="$ARGS --admin-letter-lookback-days $INPUT_ADMIN_LETTER_LOOKBACK_DAYS"
+          fi
+          if [ -n "$INPUT_REQUEST_LOOKBACK_DAYS" ]; then
+            ARGS="$ARGS --request-lookback-days $INPUT_REQUEST_LOOKBACK_DAYS"
           fi
           python queue_value_left_scan.py $ARGS
