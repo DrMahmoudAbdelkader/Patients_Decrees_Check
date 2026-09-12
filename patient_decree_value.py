@@ -161,6 +161,21 @@ _TATWEEL_RE = re.compile(r"\u0640")  # ـ elongation character
 _ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200F\uFEFF]")
 _WHITESPACE_RE = re.compile(r"\s+")
 _ALEF_VARIANTS_RE = re.compile(r"[\u0622\u0623\u0625\u0671]")  # آ أ إ ٱ -> ا
+# !! ADDED (2026-09-12) !! The two most common Arabic spelling-variant
+# sources of a real catalog match silently becoming 'unmapped': teh
+# marbuta (ة) vs a plain heh (ه) at word endings (e.g. "المتابعه" vs
+# "المتابعة" -- both already appear as separate catalog rows for the
+# same Taxane regimen, which is exactly the symptom this was causing:
+# a live decree ending in the OTHER variant than whichever catalog row
+# happened to be typed never matched, fell through to 'unmapped', and
+# got flagged regardless of how much real value was left), and alef
+# maksura (ى) vs a plain yeh (ي) (e.g. "علاج تدعيمي" vs "علاج تدعيمى").
+# Folding both to one canonical form on both sides removes an entire
+# class of false-'unmapped' results without weakening the "still not
+# fuzzy" guarantee below -- these two pairs are visually near-identical
+# keystroke variants, not different words.
+_TEH_MARBUTA_RE = re.compile(r"\u0629")  # ة -> ه
+_ALEF_MAKSURA_RE = re.compile(r"\u0649")  # ى -> ي
 
 
 def normalize_decree_description(text: Optional[str]) -> str:
@@ -170,10 +185,12 @@ def normalize_decree_description(text: Optional[str]) -> str:
     never lost purely to formatting differences that don't change what
     the decree actually is: NFKC-normalizes, strips zero-width chars
     and Arabic diacritics/tatweel, folds alef-hamza variants to a bare
-    alef, collapses all whitespace runs to a single space, and trims.
-    This is deliberately NOT a fuzzy/approximate match -- two
-    descriptions that differ in real wording still won't match; it
-    only neutralizes formatting noise that has no bearing on identity.
+    alef, folds teh-marbuta/heh and alef-maksura/yeh word-ending
+    variants to one form each, collapses all whitespace runs to a
+    single space, and trims. This is deliberately NOT a fuzzy/
+    approximate match -- two descriptions that differ in real wording
+    still won't match; it only neutralizes formatting/spelling-variant
+    noise that has no bearing on identity.
     """
     if not text:
         return ""
@@ -182,6 +199,8 @@ def normalize_decree_description(text: Optional[str]) -> str:
     t = _ARABIC_DIACRITICS_RE.sub("", t)
     t = _TATWEEL_RE.sub("", t)
     t = _ALEF_VARIANTS_RE.sub("\u0627", t)
+    t = _TEH_MARBUTA_RE.sub("\u0647", t)
+    t = _ALEF_MAKSURA_RE.sub("\u064A", t)
     t = _WHITESPACE_RE.sub(" ", t)
     return t.strip()
 

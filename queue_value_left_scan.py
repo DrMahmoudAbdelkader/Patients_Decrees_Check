@@ -826,13 +826,29 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
         is_current = d.get("regimen_status") == "current"
         dose_covered = evaluate_dose_coverage(d, real_left) if is_current else None
 
+        # !! ADDED (2026-09-12) !! Supportive decrees are catalog-flagged
+        # (is_supportive) precisely because "does this cover one more
+        # dose" isn't a meaningful gate for them the way it is for an
+        # active chemo backbone -- per spec, a supportive decree should
+        # never land in the tracked/needs-attention list no matter what
+        # dose_covered or the value left says. It's still written out
+        # with its own category/status (still explorable, still counted
+        # for its own real_value_left etc.) -- it just can never set
+        # needs_attention = True. This check runs FIRST and short-
+        # circuits everything below, including the 'unmapped' case, so
+        # a supportive decree that also happens to be unmapped (should
+        # only ever apply to the rare not-yet-catalogued one) still
+        # isn't flagged purely on that account.
+        #
         # Only a CURRENT decree drives needs_attention -- a
         # superseded/previous-cycle row is history, not something
         # tomorrow's dispensing decision hinges on. An 'unmapped'
         # decree (not yet in decree_medication_catalog) is flagged so
         # it doesn't silently vanish from the report, per the note
         # above.
-        if d.get("regimen_status") == "unmapped":
+        if d.get("is_supportive"):
+            needs_attention = False
+        elif d.get("regimen_status") == "unmapped":
             needs_attention = True
         elif is_current:
             needs_attention = dose_covered is not True  # False or None (unknown) both need a human look
