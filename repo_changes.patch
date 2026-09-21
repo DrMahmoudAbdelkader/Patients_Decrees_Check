@@ -1,0 +1,324 @@
+--- a/patient_decree_value.py	2026-09-21 21:04:40.949728316 +0000
++++ b/patient_decree_value.py	2026-09-21 21:04:40.956529380 +0000
+@@ -136,6 +136,9 @@
+ import supabase_client as sb
+ from daily_sync import extract_row_data, parse_due_period_days, parse_smc_date, _to_number
+ from cairo_date import cairo_today_iso
++# Same alias table the category badges use, so "is this a medication?" is
++# decided by ONE normalizer everywhere (see decree_category.py).
++from decree_category import _normalize_catalog_category, DEFAULT_CATALOG_CATEGORY
+ 
+ CATALOG_TABLE = "decree_medication_catalog"
+ VALUE_LEFT_HISTORY_TABLE = "decree_value_left_daily_scan"
+@@ -231,7 +234,8 @@
+         rows = sb.fetch_all(
+             CATALOG_TABLE,
+             "decree_description,treatment_plan_name,reception_display_name,is_cycles,average_dose_value,is_supportive,"
+-            "exclusivity_group,financial_review_scope,depot_value,depot_interval_months,partner_value",
++            "exclusivity_group,financial_review_scope,depot_value,depot_interval_months,partner_value,"
++            "service_type_Catalog",
+         )
+     except Exception as e:
+         logging.error(f"[value-left] could not load {CATALOG_TABLE} ({e}) -- "
+@@ -423,6 +427,8 @@
+                 'depot_value': catalog_entry.get('depot_value'),
+                 'depot_interval_months': catalog_entry.get('depot_interval_months'),
+                 'partner_value': catalog_entry.get('partner_value'),
++                # REVISION 3: needed by evaluate_attention()'s "not a medication" exemption.
++                'service_type': catalog_entry.get('service_type_Catalog'),
+             })
+         except Exception as e:
+             logging.error(f"[value-left] failed to parse a decree row for patient {national_id}: {e}")
+@@ -533,7 +539,8 @@
+ 
+ def evaluate_dose_coverage(decree: Dict, real_value_left: Optional[float],
+                             as_of_iso: Optional[str] = None,
+-                            value_left_history: Optional[List[Dict]] = None) -> Optional[bool]:
++                            value_left_history: Optional[List[Dict]] = None,
++                            check_expiry: bool = True) -> Optional[bool]:
+     """
+     Single source of truth for the "can this patient dispense ONE MORE
+     dose against this decree right now" check (your Q3/Q4 answers) --
+@@ -584,7 +591,10 @@
+     if real_value_left is None:
+         return None
+ 
+-    if is_decree_expired(decree.get('decree_expiry_date'), as_of_iso):
++    # `check_expiry=False` is used by evaluate_attention(), which reports
++    # expiry as its OWN reason instead of folding it into "not covered".
++    # Every other caller keeps the default (True) and behaves as before.
++    if check_expiry and is_decree_expired(decree.get('decree_expiry_date'), as_of_iso):
+         return False
+ 
+     if decree.get('depot_interval_months'):
+@@ -605,3 +615,138 @@
+         return real_value_left > SUPPORTIVE_VALUE_FLOOR
+ 
+     return None
++
++
++# ---------------------------------------------------------------------
++# REVISION 3 (2026-09-21) -- evaluate_attention()
++# ---------------------------------------------------------------------
++# WHY THIS EXISTS
++#   The daily scan used to derive needs_attention from
++#   evaluate_dose_coverage() alone. That function returns False for ANY
++#   expired decree BEFORE it looks at the cutoff, so:
++#     * a decree with cutoff 0 (non-medical / supportive / pain) that had
++#       merely passed its expiry date was flagged, whatever its value;
++#     * a decree with its full value untouched was flagged just for being
++#       past its expiry date;
++#     * the flag never said WHICH of the two triggers fired.
++#   financial_review_scope (out_of_scope_*) was loaded but never used, and
++#   a non-medical decree was only ever protected by its cutoff being 0.
++#
++# THE RULE NOW (in order)
++#   1. unmapped (raw text not in the catalog / no plan)  -> flag
++#   2. not the 'current' decree of its plan              -> never flag
++#   3. exempt from the financial check                   -> never flag
++#        supportive | financial_review_scope != in_scope |
++#        service type is not Medication | cutoff is 0
++#      (exemption covers BOTH triggers -- value AND expiry)
++#   4. otherwise flag if any of: value unknown, no cutoff, value below
++#      one dose, decree expired -- and say which one in `reason`.
++#
++# An expired decree is still flagged (an expired medication decree does
++# need a human), but never silently: reason = 'expired' /
++# 'expired_and_insufficient' plus days_since_expiry, so staff can tell an
++# expiry-only flag (some decrees stay usable ~30 days past expiry) from a
++# genuine low-value flag.
++
++# Reasons that mean "no flag".
++ATTENTION_REASONS_OK = (
++    "ok", "non_current",
++    "exempt_supportive", "exempt_out_of_scope", "exempt_non_medication", "exempt_zero_cutoff",
++)
++
++
++def value_check_exemption(decree: Dict) -> Optional[str]:
++    """Reason string if this decree must never be flagged, else None."""
++    if decree.get("is_supportive"):
++        return "exempt_supportive"
++
++    scope = decree.get("financial_review_scope") or "in_scope"
++    if scope != "in_scope":
++        return "exempt_out_of_scope"
++
++    category = _normalize_catalog_category(decree.get("service_type")) or DEFAULT_CATALOG_CATEGORY
++    if category != "medication":
++        return "exempt_non_medication"
++
++    avg = decree.get("average_dose_value")
++    try:
++        cutoff_is_zero = avg is not None and float(avg) == 0.0
++    except (TypeError, ValueError):
++        cutoff_is_zero = False
++    # A depot+partner decree (Zoladex) derives its cutoff from history,
++    # so a 0 in the static column is never a "no floor" declaration there.
++    if cutoff_is_zero and not decree.get("depot_interval_months"):
++        return "exempt_zero_cutoff"
++
++    return None
++
++
++def _days_since(iso_date: Optional[str], as_of_iso: Optional[str]) -> Optional[int]:
++    if not iso_date:
++        return None
++    as_of_iso = as_of_iso or cairo_today_iso()
++    try:
++        return (datetime.strptime(as_of_iso, "%Y-%m-%d") - datetime.strptime(iso_date, "%Y-%m-%d")).days
++    except ValueError:
++        return None
++
++
++def _money(x) -> str:
++    try:
++        return f"{float(x):,.2f}"
++    except (TypeError, ValueError):
++        return str(x)
++
++
++def evaluate_attention(decree: Dict, real_value_left: Optional[float],
++                       as_of_iso: Optional[str] = None,
++                       value_left_history: Optional[List[Dict]] = None) -> Dict:
++    """Single source of truth for needs_attention. Returns
++        {needs_attention: bool, reason: str, detail: str|None,
++         days_since_expiry: int|None}
++    `reason` is one of ATTENTION_REASONS_OK (no flag) or:
++        unmapped | value_unknown | no_cutoff_value |
++        insufficient_value | expired | expired_and_insufficient
++    `detail` is a short Arabic sentence for the UI; only set for flags."""
++    regimen = decree.get("regimen_status")
++
++    exemption = value_check_exemption(decree)
++    if exemption:
++        return {"needs_attention": False, "reason": exemption, "detail": None, "days_since_expiry": None}
++
++    if regimen == "unmapped":
++        return {"needs_attention": True, "reason": "unmapped", "days_since_expiry": None,
++                "detail": "وصف القرار غير موجود في كتالوج القرارات (يحتاج إضافة/ربط)"}
++
++    if regimen != "current":
++        return {"needs_attention": False, "reason": "non_current", "detail": None, "days_since_expiry": None}
++
++    expired = is_decree_expired(decree.get("decree_expiry_date"), as_of_iso)
++    days_exp = _days_since(decree.get("decree_expiry_date"), as_of_iso) if expired else None
++
++    if real_value_left is None:
++        return {"needs_attention": True, "reason": "value_unknown", "days_since_expiry": days_exp,
++                "detail": "تعذر حساب المتبقي الفعلي (قيمة المتبقي من موقع SMC غير متاحة)"}
++
++    value_ok = evaluate_dose_coverage(decree, real_value_left, as_of_iso, value_left_history,
++                                      check_expiry=False)
++    if value_ok is None:
++        return {"needs_attention": True, "reason": "no_cutoff_value", "days_since_expiry": days_exp,
++                "detail": "لا توجد قيمة جرعة (Average_Dose_Value) لهذا القرار في الكتالوج"}
++
++    avg = decree.get("average_dose_value")
++    dose_txt = "" if (decree.get("depot_interval_months") or avg is None) else f" ({_money(avg)})"
++
++    if expired and not value_ok:
++        return {"needs_attention": True, "reason": "expired_and_insufficient", "days_since_expiry": days_exp,
++                "detail": f"القرار منتهي منذ {days_exp} يوم والمتبقي الفعلي {_money(real_value_left)} "
++                          f"أقل من قيمة الجرعة{dose_txt}"}
++    if expired:
++        return {"needs_attention": True, "reason": "expired", "days_since_expiry": days_exp,
++                "detail": f"القرار منتهي منذ {days_exp} يوم (تاريخ الانتهاء {decree.get('decree_expiry_date')}) "
++                          f"- المتبقي الفعلي {_money(real_value_left)} يكفي جرعة"}
++    if not value_ok:
++        return {"needs_attention": True, "reason": "insufficient_value", "days_since_expiry": None,
++                "detail": f"المتبقي الفعلي {_money(real_value_left)} أقل من قيمة الجرعة{dose_txt}"}
++
++    return {"needs_attention": False, "reason": "ok", "detail": None, "days_since_expiry": None}
+--- a/queue_value_left_scan.py	2026-09-21 21:04:41.105728325 +0000
++++ b/queue_value_left_scan.py	2026-09-21 21:04:41.113495000 +0000
+@@ -94,6 +94,14 @@
+      counts) or 'error' (with a message) so the frontend's poll loop
+      knows when to stop and what to show.
+ 
++!! REVISION 3 (2026-09-21) -- needs_attention rules !!
++  Flag logic moved to patient_decree_value.evaluate_attention(). Decrees that are
++  supportive, out_of_scope in the catalog, not a Medication (service_type_Catalog),
++  or have cutoff 0 are never flagged (expiry included). Any other CURRENT decree is
++  flagged for value/expiry/unknown-cutoff, and the new attention_reason,
++  attention_detail and days_since_expiry columns say which. Requires the 3 new columns
++  on decree_value_left_daily_scan (see decree_catalog_fix.sql, STEP 1) BEFORE deploying.
++
+ !! ASSUMPTIONS TO CONFIRM / ADJUST !!
+   - DAYCARE_CLINICS: every clinic name in daily_sync.py's own
+     ALLOWED_CLINICS that contains "day care" or "daycare". Edit the
+@@ -133,7 +141,7 @@
+ import supabase_client as sb
+ from daily_sync import fetch_and_parse_queue, build_queue_rows, ALLOWED_CLINICS
+ from hmis_id_resolver import HmisIdResolver
+-from patient_decree_value import get_patient_decree_value_details, evaluate_dose_coverage
++from patient_decree_value import get_patient_decree_value_details, evaluate_dose_coverage, evaluate_attention
+ from lookup_patient_decree_value import fetch_pending_unsubmitted_value
+ from decree_category import categorize_decree, get_category_map
+ from decree_name_map import normalize_request_text
+@@ -814,6 +822,9 @@
+             "next_dose_covered": None,
+             "category": None,
+             "needs_attention": True,  # no decree at all -> always needs attention
++            "attention_reason": "no_decree",
++            "attention_detail": "لا يوجد أي قرار للمريض على موقع SMC",
++            "days_since_expiry": None,
+             **pending_scalar_fields,
+         }]
+ 
+@@ -826,34 +837,16 @@
+         is_current = d.get("regimen_status") == "current"
+         dose_covered = evaluate_dose_coverage(d, real_left) if is_current else None
+ 
+-        # !! ADDED (2026-09-12) !! Supportive decrees are catalog-flagged
+-        # (is_supportive) precisely because "does this cover one more
+-        # dose" isn't a meaningful gate for them the way it is for an
+-        # active chemo backbone -- per spec, a supportive decree should
+-        # never land in the tracked/needs-attention list no matter what
+-        # dose_covered or the value left says. It's still written out
+-        # with its own category/status (still explorable, still counted
+-        # for its own real_value_left etc.) -- it just can never set
+-        # needs_attention = True. This check runs FIRST and short-
+-        # circuits everything below, including the 'unmapped' case, so
+-        # a supportive decree that also happens to be unmapped (should
+-        # only ever apply to the rare not-yet-catalogued one) still
+-        # isn't flagged purely on that account.
+-        #
+-        # Only a CURRENT decree drives needs_attention -- a
+-        # superseded/previous-cycle row is history, not something
+-        # tomorrow's dispensing decision hinges on. An 'unmapped'
+-        # decree (not yet in decree_medication_catalog) is flagged so
+-        # it doesn't silently vanish from the report, per the note
+-        # above.
+-        if d.get("is_supportive"):
+-            needs_attention = False
+-        elif d.get("regimen_status") == "unmapped":
+-            needs_attention = True
+-        elif is_current:
+-            needs_attention = dose_covered is not True  # False or None (unknown) both need a human look
+-        else:
+-            needs_attention = False
++        # !! REVISION 3 (2026-09-21) !! needs_attention now comes from
++        # patient_decree_value.evaluate_attention() -- see the long note
++        # there. In short: exempt decrees (supportive / out-of-scope /
++        # non-medication / cutoff 0) are NEVER flagged for any reason,
++        # including expiry; everything else is flagged for value OR
++        # expiry, and `attention_reason` says which. Before this, an
++        # expired decree was flagged regardless of cutoff and the row
++        # never said why.
++        attention = evaluate_attention(d, real_left)
++        needs_attention = attention["needs_attention"]
+ 
+         category, category_action = categorize_decree(d.get("decree_description"))
+         if category_action == "pending" and d.get("decree_description"):
+@@ -878,6 +871,9 @@
+             "real_value_left": real_left,
+             "next_dose_covered": dose_covered,
+             "needs_attention": needs_attention,
++            "attention_reason": attention["reason"],
++            "attention_detail": attention["detail"],
++            "days_since_expiry": attention["days_since_expiry"],
+             **pending_scalar_fields,
+         })
+     return out_rows
+--- a/load_decree_medication_catalog.py	2026-09-21 21:04:41.115018283 +0000
++++ b/load_decree_medication_catalog.py	2026-09-21 21:04:41.116475313 +0000
+@@ -16,11 +16,21 @@
+ Duplicate raw descriptions in the map file (exact repeated rows) are
+ silently collapsed to one, keeping the first occurrence.
+ 
++!! WARNING (2026-09-21) !! The live table is now edited directly in Supabase and
++has more rows/columns than the two Excel files. Running this WITHOUT --dry-run
++overwrites, for every description in those files: treatment_plan_name,
++average_dose_value, is_cycles, procedure_code, is_supportive, needs_cutoff_value
++-- i.e. it reverts the corrected names and cutoffs. It does not touch
++reception_display_name, service_type_Catalog, financial_review_scope,
++exclusivity_group or the depot columns. A real run therefore requires
++--allow-overwrite.
++
+ Usage:
+     python load_decree_medication_catalog.py \\
+         --map-file Decrees_Description_Map.xlsx \\
+         --cutoff-file Decreees_Cutt_Off_Values.xlsx
+     python load_decree_medication_catalog.py ... --dry-run
++    python load_decree_medication_catalog.py ... --allow-overwrite   # real write
+ """
+ 
+ import os
+@@ -143,8 +153,16 @@
+     parser.add_argument("--map-file", required=True, help="Path to Decrees_Description_Map.xlsx")
+     parser.add_argument("--cutoff-file", required=True, help="Path to Decreees_Cutt_Off_Values.xlsx")
+     parser.add_argument("--dry-run", action="store_true")
++    parser.add_argument("--allow-overwrite", action="store_true",
++                        help="Required for a real (non --dry-run) write; see the WARNING in the module docstring.")
+     args = parser.parse_args()
+ 
++    if not args.dry_run and not args.allow_overwrite:
++        logging.error("Refusing to write: this would overwrite the live decree_medication_catalog "
++                      "names/cutoffs from the Excel files. Use --dry-run to preview, or pass "
++                      "--allow-overwrite if you really mean it.")
++        sys.exit(2)
++
+     map_data = load_map_file(args.map_file)
+     cutoff_data = load_cutoff_file(args.cutoff_file)
+     logging.info(f"Map file: {len(map_data)} unique description(s). Cutoff file: {len(cutoff_data)} description(s).")

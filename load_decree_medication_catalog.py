@@ -16,11 +16,21 @@ fix the underlying description in the map file.
 Duplicate raw descriptions in the map file (exact repeated rows) are
 silently collapsed to one, keeping the first occurrence.
 
+!! WARNING (2026-09-21) !! The live table is now edited directly in Supabase and
+has more rows/columns than the two Excel files. Running this WITHOUT --dry-run
+overwrites, for every description in those files: treatment_plan_name,
+average_dose_value, is_cycles, procedure_code, is_supportive, needs_cutoff_value
+-- i.e. it reverts the corrected names and cutoffs. It does not touch
+reception_display_name, service_type_Catalog, financial_review_scope,
+exclusivity_group or the depot columns. A real run therefore requires
+--allow-overwrite.
+
 Usage:
     python load_decree_medication_catalog.py \\
         --map-file Decrees_Description_Map.xlsx \\
         --cutoff-file Decreees_Cutt_Off_Values.xlsx
     python load_decree_medication_catalog.py ... --dry-run
+    python load_decree_medication_catalog.py ... --allow-overwrite   # real write
 """
 
 import os
@@ -143,7 +153,15 @@ def main():
     parser.add_argument("--map-file", required=True, help="Path to Decrees_Description_Map.xlsx")
     parser.add_argument("--cutoff-file", required=True, help="Path to Decreees_Cutt_Off_Values.xlsx")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--allow-overwrite", action="store_true",
+                        help="Required for a real (non --dry-run) write; see the WARNING in the module docstring.")
     args = parser.parse_args()
+
+    if not args.dry_run and not args.allow_overwrite:
+        logging.error("Refusing to write: this would overwrite the live decree_medication_catalog "
+                      "names/cutoffs from the Excel files. Use --dry-run to preview, or pass "
+                      "--allow-overwrite if you really mean it.")
+        sys.exit(2)
 
     map_data = load_map_file(args.map_file)
     cutoff_data = load_cutoff_file(args.cutoff_file)
