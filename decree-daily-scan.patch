@@ -1,0 +1,181 @@
+--- a/decree-daily-scan.js	2026-09-21 21:32:07.703526570 +0000
++++ b/decree-daily-scan.js	2026-09-21 21:32:07.705423994 +0000
+@@ -36,6 +36,24 @@
+  *     if an older backend hasn't been redeployed yet.
+  *   - Added an Excel export of whatever is currently sorted/filtered
+  *     on screen (see ddsExportExcel()).
++ *
++ * REVISION 3 (2026-09-21) -- synced with the backend flag-logic fix
++ * (patient_decree_value.evaluate_attention + the 3 new columns on
++ * decree_value_left_daily_scan):
++ *   - The final-assessment cell now shows WHY a row needs follow-up,
++ *     from `attention_reason` / `attention_detail`: value below one
++ *     dose, expired (value still covers a dose), both, or a data gap.
++ *     Rows scanned BEFORE the backend update have no attention_reason
++ *     and keep rendering exactly as before (see attentionBadgeHtml()).
++ *   - Expiry cell shows a red "منتهي منذ N يوم" chip from
++ *     `days_since_expiry` (new rows only).
++ *   - Summary bar splits the flagged count by reason.
++ *   - New sort option "سبب المتابعة".
++ *   - The English-name column is now labelled "Medicinal Name" (screen
++ *     and Excel) instead of "الاسم التجاري"; "الاسم المختصر" unchanged.
++ *   - Excel export appends "سبب المتابعة", "تفاصيل سبب المتابعة" and
++ *     "أيام منذ الانتهاء" at the END so existing column positions
++ *     don't shift.
+  */
+ 
+ (function () {
+@@ -108,6 +126,29 @@
+         return `<span class="px-2 py-1 rounded-full text-xs font-medium ${b.css}">${escapeHtml(b.label)}</span>`;
+     }
+ 
++    // attention_reason values written by patient_decree_value.evaluate_attention().
++    // `flag: true` reasons are the ones with needs_attention = true.
++    const ATTENTION_REASONS = {
++        insufficient_value:       { label: '⚠ الرصيد أقل من قيمة الجرعة',        css: 'bg-red-100 text-red-800',       flag: true },
++        expired_and_insufficient: { label: '⚠ منتهي + الرصيد أقل من الجرعة',     css: 'bg-red-100 text-red-800',       flag: true },
++        expired:                  { label: '⏰ قرار منتهي — الرصيد يكفي جرعة',    css: 'bg-orange-100 text-orange-800', flag: true },
++        value_unknown:            { label: '؟ تعذر حساب الرصيد',                  css: 'bg-gray-200 text-gray-800',     flag: true },
++        no_cutoff_value:          { label: '؟ لا توجد قيمة جرعة بالكتالوج',       css: 'bg-gray-200 text-gray-800',     flag: true },
++        unmapped:                 { label: '؟ قرار غير مصنف بالكتالوج',           css: 'bg-red-100 text-red-800',       flag: true },
++        ok:                       { label: '✓ جاهز',                               css: 'bg-green-100 text-green-800' },
++        non_current:              { label: 'قرار سابق / مستبدل',                   css: 'bg-gray-100 text-gray-600' },
++        exempt_supportive:        { label: '✓ علاج تدعيمي — بلا فحص مالي',         css: 'bg-green-50 text-green-700' },
++        exempt_out_of_scope:      { label: '✓ خارج نطاق المراجعة المالية',         css: 'bg-green-50 text-green-700' },
++        exempt_non_medication:    { label: '✓ ليس بروتوكولًا دوائيًا — بلا فحص مالي', css: 'bg-green-50 text-green-700' },
++        exempt_zero_cutoff:       { label: '✓ بلا حد أدنى للجرعة',                 css: 'bg-green-50 text-green-700' },
++    };
++    // Order used by the "سبب المتابعة" sort: real value gaps first, then
++    // expiry-only, then data gaps; anything not flagged sorts last.
++    const ATTENTION_REASON_ORDER = {
++        insufficient_value: 0, expired_and_insufficient: 1, expired: 2,
++        value_unknown: 3, no_cutoff_value: 4, unmapped: 5,
++    };
++
+     // decree_category.py's categorize_decree() now reads the catalog's
+     // OWN service_type_Catalog column per row (falling back to
+     // 'medication' only when that column is blank) instead of
+@@ -147,6 +188,25 @@
+         if (row.decree_number === '') {
+             return '<span class="px-2 py-1 rounded-full text-xs font-medium bg-red-100 text-red-800">لا يوجد قرار</span>';
+         }
++        // REVISION 3: rows written by the updated backend carry the reason.
++        if (row.attention_reason) {
++            const known = ATTENTION_REASONS[row.attention_reason];
++            const reason = known || {
++                label: row.attention_reason,
++                css: row.needs_attention ? 'bg-amber-100 text-amber-800' : 'bg-gray-100 text-gray-600',
++            };
++            const pendingChip = (row.needs_attention && row.has_pending_request)
++                ? '<span class="px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800">يوجد طلب مسجل</span>'
++                : '';
++            const detail = (row.needs_attention && row.attention_detail)
++                ? `<div class="text-xs text-gray-600">${escapeHtml(row.attention_detail)}</div>`
++                : '';
++            return `<div class="flex flex-col items-start gap-1">
++                <span class="px-2 py-1 rounded-full text-xs font-medium ${reason.css}">${escapeHtml(reason.label)}</span>
++                ${pendingChip}${detail}
++            </div>`;
++        }
++        // Legacy rows (scanned before the backend update): unchanged.
+         if (!row.needs_attention) {
+             return '<span class="px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">✓ جاهز</span>';
+         }
+@@ -304,6 +364,15 @@
+                 ? (a.needs_attention ? -1 : 1)
+                 : byDecreeNumber(a, b),
+         },
++        attention_reason: {
++            label: 'سبب المتابعة (رصيد / انتهاء / بيانات ناقصة)',
++            groupRank: (rows) => Math.min(...rows.map(r => ATTENTION_REASON_ORDER[r.attention_reason] ?? 9)),
++            within: (a, b) => {
++                const ao = ATTENTION_REASON_ORDER[a.attention_reason] ?? 9;
++                const bo = ATTENTION_REASON_ORDER[b.attention_reason] ?? 9;
++                return ao !== bo ? ao - bo : byDecreeNumber(a, b);
++            },
++        },
+         unmapped_first: {
+             label: 'غير مصنف بالكتالوج أولًا',
+             groupRank: (rows) => rows.some(r => r.regimen_status === 'unmapped') ? 0 : 1,
+@@ -646,6 +715,14 @@
+             const multiPendingPatients = new Set(
+                 rows.filter(r => pendingRequestsForRow(r).length >= 2).map(r => r.patient_id)
+             ).size;
++            // REVISION 3: split the flagged count by reason -- only when the
++            // rows come from the updated backend (older rows have no reason).
++            const hasReasons = rows.some(r => r.attention_reason);
++            const countReasons = (...codes) => flagged.filter(r => codes.includes(r.attention_reason)).length;
++            const reasonChipsHtml = hasReasons ? `
++                    <div class="px-4 py-2 bg-red-50 rounded-lg border border-red-200">الرصيد أقل من الجرعة: <b>${countReasons('insufficient_value', 'expired_and_insufficient')}</b></div>
++                    <div class="px-4 py-2 bg-orange-50 rounded-lg border border-orange-200">منتهي فقط (الرصيد يكفي): <b>${countReasons('expired')}</b></div>
++                    <div class="px-4 py-2 bg-gray-50 rounded-lg border">بيانات ناقصة: <b>${countReasons('value_unknown', 'no_cutoff_value', 'unmapped')}</b></div>` : '';
+             setStatus(`نتائج يوم ${scanDateIso} — ${rows.length} صف عبر ${distinctPatients} مريض.`);
+             setSummaryHtml(`
+                 <div class="flex gap-4 flex-wrap text-sm">
+@@ -654,6 +731,7 @@
+                     <div class="px-4 py-2 bg-amber-50 rounded-lg border border-amber-200">يحتاج متابعة: <b>${flagged.length}</b></div>
+                     <div class="px-4 py-2 bg-red-50 rounded-lg border border-red-200">فجوة حقيقية (بلا طلب): <b>${trueGaps.length}</b></div>
+                     <div class="px-4 py-2 bg-purple-50 rounded-lg border border-purple-200">لديهم أكثر من طلب معلق: <b>${multiPendingPatients}</b></div>
++                    ${reasonChipsHtml}
+                 </div>
+             `);
+             attentionOnly = false;
+@@ -822,6 +900,14 @@
+         `;
+     }
+ 
++    function expiryCellHtml(r) {
++        const days = Number(r.days_since_expiry);
++        const chip = days > 0
++            ? `<div class="mt-1"><span class="px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">منتهي منذ ${days} يوم</span></div>`
++            : '';
++        return `${escapeHtml(fmtDate(r.decree_expiry_date))}${chip}`;
++    }
++
+     function decreeRowHtml(r) {
+         const dimClass = !r.needs_attention ? 'opacity-60' : '';
+         return `
+@@ -835,7 +921,7 @@
+                 <td class="p-3 font-bold ${Number(r.real_value_left) <= 0 ? 'text-red-600' : 'text-green-700'}">
+                     ${fmtMoney(r.real_value_left)}
+                 </td>
+-                <td class="p-3">${fmtDate(r.decree_expiry_date)}</td>
++                <td class="p-3">${expiryCellHtml(r)}</td>
+                 <td class="p-3">${attentionBadgeHtml(r)}</td>
+             </tr>
+         `;
+@@ -858,12 +944,12 @@
+                         <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">رقم القرار</th>
+                         <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">الوصف الأصلي</th>
+                         <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">الاسم المختصر</th>
+-                        <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">الاسم التجاري</th>
++                        <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">Medicinal Name</th>
+                         <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">نوع الخدمة</th>
+                         <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">حالة الدورة</th>
+                         <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">القيمة الحقيقية المتبقية</th>
+                         <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">تاريخ الانتهاء</th>
+-                        <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800"> االتقييم النهائي المبدأي (يخضع للمراجعه من قبل المسؤول للتأكد من النتائج)</th>
++                        <th class="sticky top-0 z-10 bg-gray-100 border-b-2 border-gray-300 p-4 text-right text-sm font-bold text-gray-800">التقييم النهائي المبدأي (يخضع للمراجعه من قبل المسؤول للتأكد من النتائج)</th>
+                     </tr>
+                 </thead>
+                 <tbody>${bodyHtml}</tbody>
+@@ -942,7 +1028,7 @@
+                         'رقم القرار': r.decree_number || '',
+                         'الوصف الأصلي': r.decree_description || '',
+                         'الاسم المختصر': r.reception_display_name || '',
+-                        'الاسم التجاري': r.treatment_plan_name || '',
++                        'Medicinal Name': r.treatment_plan_name || '',
+                         'نوع الخدمة': categoryLabel(r.category),
+                         'حالة الدورة': REGIMEN_BADGES[r.regimen_status]?.label || r.regimen_status || '',
+                         'القيمة الحقيقية المتبقية': r.real_value_left ?? '',
+@@ -964,6 +1050,10 @@
+                         'تاريخ لجنة الخطاب الإداري': latestLetter?.committee_date || '',
+                         'خطة علاج الخطاب الإداري': latestLetter?.treatment_plan || '',
+                         'نص رد الخطاب الإداري': latestLetter?.response_text || '',
++                        // REVISION 3 -- also appended at the end.
++                        'سبب المتابعة': ATTENTION_REASONS[r.attention_reason]?.label || r.attention_reason || '',
++                        'تفاصيل سبب المتابعة': r.attention_detail || '',
++                        'أيام منذ الانتهاء': r.days_since_expiry ?? '',
+                     });
+                 }
+             }
