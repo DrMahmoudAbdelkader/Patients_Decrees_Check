@@ -587,21 +587,196 @@ def evaluate_dose_coverage(decree: Dict, real_value_left: Optional[float],
     if is_decree_expired(decree.get('decree_expiry_date'), as_of_iso):
         return False
 
+    cutoff, source = resolve_dose_cutoff(decree, as_of_iso, value_left_history)
+    if cutoff is None:
+        return None
+    if source == "supportive_floor":
+        return real_value_left > cutoff  # strict ">" -- unchanged from before the refactor
+    return real_value_left >= cutoff
+
+
+# =====================================================================
+# ATTENTION REASONS  (REVISION 3 backend -- see decree-daily-scan.js)
+# =====================================================================
+# evaluate_dose_coverage() above deliberately collapses everything into
+# one tri-state answer, so "the decree EXPIRED" and "the decree has NOT
+# ENOUGH VALUE" both come back as False and a flagged row can't say which
+# one it is. evaluate_attention() below keeps that exact flagging
+# decision (needs_attention is True for precisely the same rows) and
+# adds WHY, using the reason codes decree-daily-scan.js already knows how
+# to render (ATTENTION_REASONS there -- keep the two in sync).
+#
+#   insufficient_value        value left < one dose (decree still valid)
+#   expired_and_insufficient  decree expired AND value left < one dose
+#   expired                   decree expired, value left still covers a dose
+#   value_unknown             real value left couldn't be computed
+#   no_cutoff_value           no average_dose_value in the catalog row
+#   unmapped                  description not in decree_medication_catalog
+#   no_decree                 patient has no decree on file at all
+#   ok                        valid and covers a dose
+#   exempt_zero_cutoff        valid, catalog says "no minimum dose" (cutoff 0)
+#   exempt_supportive         supportive decree -- never flagged
+#   non_current               superseded / previous cycle / protocol shift
+
+
+def resolve_dose_cutoff(decree: Dict, as_of_iso: Optional[str] = None,
+                        value_left_history: Optional[List[Dict]] = None):
+    """The "one dose" amount a decree's real_value_left is compared
+    against. Returns (cutoff, source) where source is 'depot' (dynamic
+    depot+partner cutoff), 'catalog' (decree_medication_catalog.
+    average_dose_value, including 0), 'supportive_floor'
+    (SUPPORTIVE_VALUE_FLOOR fallback for a supportive decree with no
+    catalog value) or None when there is no cutoff at all (cutoff None).
+
+    Same precedence evaluate_dose_coverage() has always used; it now
+    calls this, so the two can never drift apart.
+    """
     if decree.get('depot_interval_months'):
         visit_date = as_of_iso or cairo_today_iso()
         history = value_left_history if value_left_history is not None \
             else get_value_left_history(decree.get('decree_number'))
         dynamic_cutoff = expected_cutoff_for_visit(decree, visit_date, history)
         if dynamic_cutoff is not None:
-            return real_value_left >= dynamic_cutoff
+            return float(dynamic_cutoff), "depot"
         # else: no history and no issuing_date to anchor on yet --
         # fall through to the static path below rather than guessing.
 
     average_dose_value = decree.get('average_dose_value')
     if average_dose_value is not None:
-        return real_value_left >= average_dose_value
+        return float(average_dose_value), "catalog"
 
     if decree.get('is_supportive'):
-        return real_value_left > SUPPORTIVE_VALUE_FLOOR
+        return float(SUPPORTIVE_VALUE_FLOOR), "supportive_floor"
 
-    return None
+    return None, None
+
+
+def days_since_expiry(decree_expiry_date: Optional[str], as_of_iso: Optional[str] = None) -> Optional[int]:
+    """Whole days a decree has been expired as of as_of_iso (always >= 1),
+    or None if it isn't expired or its expiry date is unknown."""
+    if not is_decree_expired(decree_expiry_date, as_of_iso):
+        return None
+    as_of_iso = as_of_iso or cairo_today_iso()
+    try:
+        return (datetime.strptime(as_of_iso, "%Y-%m-%d")
+                - datetime.strptime(decree_expiry_date, "%Y-%m-%d")).days
+    except ValueError:
+        return None
+
+
+def _egp(value) -> str:
+    return f"{float(value):,.2f}"
+
+
+def _days_ar(n: int) -> str:
+    """Arabic day count with the right grammatical form (1 / 2 / 3-10 / 11+)."""
+    if n == 1:
+        return "يوم واحد"
+    if n == 2:
+        return "يومين"
+    if 3 <= n <= 10:
+        return f"{n} أيام"
+    return f"{n} يومًا"
+
+
+def evaluate_attention(decree: Dict, real_value_left: Optional[float],
+                       as_of_iso: Optional[str] = None,
+                       value_left_history: Optional[List[Dict]] = None) -> Dict:
+    """
+    Decides whether a decree needs follow-up AND says why.
+
+    Returns a dict with exactly the fields queue_value_left_scan.py writes
+    to decree_value_left_daily_scan:
+        needs_attention    bool
+        attention_reason   one of the codes listed above
+        attention_detail   short Arabic sentence with the actual numbers
+                           (only filled when the row is flagged)
+        days_since_expiry  int >= 1 when the decree is expired, else None
+        next_dose_covered  same tri-state evaluate_dose_coverage() gives
+                           (kept so that column means what it always meant)
+
+    needs_attention is True for exactly the rows the old inline logic in
+    queue_value_left_scan.scan_patient() flagged:
+        supportive            -> never flagged
+        unmapped              -> flagged
+        current               -> flagged unless dose_covered is True
+        anything else         -> not flagged
+    Only the explanation is new.
+
+    Expiry is judged "as of today" (Cairo) like evaluate_dose_coverage(),
+    not as of the appointment date.
+    """
+    def result(flag, reason, detail=None, days=None, covered=None):
+        return {
+            "needs_attention": flag,
+            "attention_reason": reason,
+            "attention_detail": detail if flag else None,
+            "days_since_expiry": days,
+            "next_dose_covered": covered,
+        }
+
+    as_of_iso = as_of_iso or cairo_today_iso()
+
+    # Supportive decrees are catalog-flagged precisely because "does it
+    # cover one more dose" isn't a meaningful gate for them -- checked
+    # first, short-circuits everything (same order as before). The
+    # next_dose_covered column is still filled for a CURRENT supportive
+    # decree, exactly as the old inline code did.
+    if decree.get('is_supportive'):
+        covered = (evaluate_dose_coverage(decree, real_value_left, as_of_iso, value_left_history)
+                   if decree.get('regimen_status') == "current" else None)
+        return result(False, "exempt_supportive", None, None, covered)
+
+    expiry = decree.get('decree_expiry_date')
+    expired = bool(is_decree_expired(expiry, as_of_iso))
+    days = days_since_expiry(expiry, as_of_iso)
+    expiry_txt = f"انتهى القرار بتاريخ {expiry} (منذ {_days_ar(days)})" if expired else ""
+
+    regimen = decree.get('regimen_status')
+    if regimen == "unmapped":
+        detail = "وصف القرار غير موجود في كتالوج القرارات"
+        if expired:
+            detail += f" — {expiry_txt}"
+        return result(True, "unmapped", detail, days)
+
+    if regimen != "current":
+        return result(False, "non_current")
+
+    # ---- current decree: the real check -------------------------------
+    history = value_left_history
+    if history is None and decree.get('depot_interval_months'):
+        history = get_value_left_history(decree.get('decree_number'))  # fetched once, reused below
+
+    covered = evaluate_dose_coverage(decree, real_value_left, as_of_iso, history)
+    cutoff, _source = resolve_dose_cutoff(decree, as_of_iso, history)
+
+    if real_value_left is None:
+        detail = "تعذر قراءة الرصيد المتبقي من الموقع"
+        if expired:
+            detail += f" — {expiry_txt}"
+        return result(True, "value_unknown", detail, days, covered)
+
+    if cutoff is None:
+        detail = "لا توجد قيمة جرعة لهذا القرار في الكتالوج (average_dose_value) — تعذر التحقق من الرصيد"
+        if expired:
+            detail += f" — {expiry_txt}"
+        return result(True, "no_cutoff_value", detail, days, covered)
+
+    value_ok = real_value_left >= cutoff
+    left_txt, dose_txt = _egp(real_value_left), _egp(cutoff)
+
+    if expired and value_ok:
+        return result(True, "expired",
+                      f"{expiry_txt} — الرصيد المتبقي {left_txt} يغطي جرعة ({dose_txt})",
+                      days, covered)
+    if expired:
+        return result(True, "expired_and_insufficient",
+                      f"{expiry_txt}، والرصيد المتبقي {left_txt} أقل من قيمة الجرعة ({dose_txt})",
+                      days, covered)
+    if not value_ok:
+        return result(True, "insufficient_value",
+                      f"الرصيد المتبقي {left_txt} أقل من قيمة الجرعة الواحدة ({dose_txt}) — العجز {_egp(cutoff - real_value_left)}",
+                      None, covered)
+    if cutoff == 0:
+        return result(False, "exempt_zero_cutoff", None, None, covered)
+    return result(False, "ok", None, None, covered)

@@ -30,7 +30,8 @@ cron behavior is completely unchanged from before this revision.
   3. Per your Q3 answer, the question this scan answers is narrowly
      "will this patient be able to dispense ONE dose tomorrow" -- not
      a full-course projection. That check
-     (patient_decree_value.evaluate_dose_coverage) is only ever run
+     (patient_decree_value.evaluate_attention, built on evaluate_dose_coverage's
+     cutoff) is only ever run
      against a decree's 'current' regimen -- a superseded/previous-cycle
      decree is written to the table too (per your Q5: keep, don't drop,
      just label clearly) but never drives needs_attention on its own.
@@ -133,7 +134,7 @@ import smc_session as smc
 import supabase_client as sb
 from daily_sync import fetch_and_parse_queue, build_queue_rows, ALLOWED_CLINICS
 from hmis_id_resolver import HmisIdResolver
-from patient_decree_value import get_patient_decree_value_details, evaluate_dose_coverage
+from patient_decree_value import get_patient_decree_value_details, evaluate_attention
 from lookup_patient_decree_value import fetch_pending_unsubmitted_value
 from decree_category import categorize_decree, get_category_map
 from decree_name_map import normalize_request_text
@@ -814,6 +815,9 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
             "next_dose_covered": None,
             "category": None,
             "needs_attention": True,  # no decree at all -> always needs attention
+            "attention_reason": "no_decree",
+            "attention_detail": "لا يوجد قرار مسجل للمريض على الموقع",
+            "days_since_expiry": None,
             **pending_scalar_fields,
         }]
 
@@ -823,37 +827,24 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
         website_left = d.get("decree_value_left_website")
         real_left = (website_left - pending_value) if website_left is not None else None
 
-        is_current = d.get("regimen_status") == "current"
-        dose_covered = evaluate_dose_coverage(d, real_left) if is_current else None
-
-        # !! ADDED (2026-09-12) !! Supportive decrees are catalog-flagged
-        # (is_supportive) precisely because "does this cover one more
-        # dose" isn't a meaningful gate for them the way it is for an
-        # active chemo backbone -- per spec, a supportive decree should
-        # never land in the tracked/needs-attention list no matter what
-        # dose_covered or the value left says. It's still written out
-        # with its own category/status (still explorable, still counted
-        # for its own real_value_left etc.) -- it just can never set
-        # needs_attention = True. This check runs FIRST and short-
-        # circuits everything below, including the 'unmapped' case, so
-        # a supportive decree that also happens to be unmapped (should
-        # only ever apply to the rare not-yet-catalogued one) still
-        # isn't flagged purely on that account.
+        # !! REVISION 3 (2026-10-10) !! The flag decision AND its reason
+        # now come from patient_decree_value.evaluate_attention() -- the
+        # backend half of what decree-daily-scan.js REVISION 3 already
+        # expected but this file never wrote (the three columns
+        # attention_reason / attention_detail / days_since_expiry stayed
+        # empty, so every flagged row fell back to the generic "not
+        # enough value" badge even when the decree had simply expired).
         #
-        # Only a CURRENT decree drives needs_attention -- a
-        # superseded/previous-cycle row is history, not something
-        # tomorrow's dispensing decision hinges on. An 'unmapped'
-        # decree (not yet in decree_medication_catalog) is flagged so
-        # it doesn't silently vanish from the report, per the note
-        # above.
-        if d.get("is_supportive"):
-            needs_attention = False
-        elif d.get("regimen_status") == "unmapped":
-            needs_attention = True
-        elif is_current:
-            needs_attention = dose_covered is not True  # False or None (unknown) both need a human look
-        else:
-            needs_attention = False
+        # The flagging rules themselves are unchanged and still live in
+        # that one function: a supportive decree is never flagged (checked
+        # first, even if unmapped); an 'unmapped' decree is flagged so it
+        # doesn't silently vanish; only a CURRENT decree is judged on
+        # expiry / value left vs one dose (superseded / previous-cycle
+        # rows are history); and an unknown value or a missing catalog
+        # cutoff is flagged for a human rather than guessed at.
+        att = evaluate_attention(d, real_left)
+        needs_attention = att["needs_attention"]
+        dose_covered = att["next_dose_covered"]
 
         category, category_action = categorize_decree(d.get("decree_description"))
         if category_action == "pending" and d.get("decree_description"):
@@ -878,6 +869,9 @@ def scan_patient(patient_id: str, scan_date_iso: str, session: smc.SMCSession,
             "real_value_left": real_left,
             "next_dose_covered": dose_covered,
             "needs_attention": needs_attention,
+            "attention_reason": att["attention_reason"],
+            "attention_detail": att["attention_detail"],
+            "days_since_expiry": att["days_since_expiry"],
             **pending_scalar_fields,
         })
     return out_rows
