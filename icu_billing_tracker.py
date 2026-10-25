@@ -495,7 +495,7 @@ def parse_receipts(html: str, decree_number: str) -> List[dict]:
 # SMC I/O
 # =====================================================================
 def _expired(resp) -> bool:
-    return resp.status_code == 200 and "Home/Index" in resp.url and "" in resp.text.lower()
+    return resp.status_code == 200 and "Home/Index" in resp.url and "username" in resp.text.lower()
 
 
 def smc_request(sess, method: str, url: str, **kw):
@@ -724,7 +724,7 @@ def run():
     # ---------------- requests portal ----------------------------------
     details_budget = MAX_DETAILS_PER_RUN
     if refresh:
-        sess_a = smc.SMCSession(username=SMC_USERNAME_2, password=smc.PASSWORD_2)
+        sess_a = smc.SMCSession(username=smc.USERNAME_2, password=smc.PASSWORD_2)
         if not sess_a.login():
             log.error("Requests-portal login failed (SMC_USERNAME_2) - aborting run.")
             upsert_uniform(RUNS_TABLE, [{"started_at": started, "finished_at": now_iso(), "ok": False,
@@ -805,7 +805,7 @@ def run():
               if r.get("is_icu") and r.get("admission_id") in refresh_ids
               and r.get("status_bucket") == "final" and r.get("decree_number")]
     if wanted:
-        sess_b = smc.SMCSession(username=SMC_USERNAME, password=smc.PASSWORD)
+        sess_b = smc.SMCSession(username=smc.USERNAME, password=smc.PASSWORD)
         if not sess_b.login():
             log.error("Decree-portal login failed (SMC_USERNAME).")
             for adm, dnum, _ in wanted:
