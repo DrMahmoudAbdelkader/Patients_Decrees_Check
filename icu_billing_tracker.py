@@ -47,6 +47,8 @@ from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import smc_session as smc    # BASE_URL, SMCSession, USERNAME(_2) / PASSWORD(_2) from the SMC_* env secrets
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("icu_billing_tracker")
 
