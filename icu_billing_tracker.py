@@ -75,6 +75,20 @@ MAX_DETAILS_PER_RUN = int(os.environ.get("MAX_DETAILS_PER_RUN", "400"))
 REQUEST_DELAY = 0.3
 EPS = 0.005   # money comparison slack (float noise only; there is NO billing tolerance)
 
+# ---- (b) run statistics -------------------------------------------------
+# Counters for the end-of-run report (what was read, what failed). Reset at the start of run().
+STATS: Dict[str, object] = {}
+
+
+def reset_stats():
+    STATS.clear()
+    STATS.update({"calls": {}, "fails": {}, "fail_samples": [], "details_fetched": 0, "details_unreadable": 0,
+                  "details_budget_exhausted": False, "decree_pages": 0, "receipt_lists": 0, "letters_read": 0,
+                  "phase_seconds": {}, "login": {}})
+
+
+reset_stats()
+
 TRACKING_TABLE = "icu_stay_tracking"
 REQUESTS_TABLE = "icu_stay_requests"
 DECREES_TABLE = "icu_stay_decrees"
@@ -502,6 +516,9 @@ def _expired(resp) -> bool:
 
 def smc_request(sess, method: str, url: str, **kw):
     """GET/POST with one automatic re-login if the session expired. Returns Response or None."""
+    # ---- (a) count SMC calls / failures per portal --------------------------
+    portal = getattr(sess, "_portal", "?")
+    STATS["calls"][portal] = STATS["calls"].get(portal, 0) + 1
     for attempt in (1, 2, 3):
         try:
             resp = sess.session.request(method, url, timeout=30, **kw)
@@ -517,6 +534,9 @@ def smc_request(sess, method: str, url: str, **kw):
         except Exception as e:
             log.warning(f"{method} {url} failed: {e} (attempt {attempt})")
         time.sleep(REQUEST_DELAY * attempt * 3)
+    STATS["fails"][portal] = STATS["fails"].get(portal, 0) + 1
+    if len(STATS["fail_samples"]) < 10:
+        STATS["fail_samples"].append(f"{portal}: {method} {url.replace(smc.BASE_URL, '')}")
     return None
 
 
@@ -679,6 +699,7 @@ def run():
     import supabase_client as sb
     import admin_letter_lookup as alu
 
+    reset_stats()
     started = now_iso()
     today = today_cairo()
     stays = load_icu_stays()
@@ -725,19 +746,30 @@ def run():
 
     # ---------------- requests portal ----------------------------------
     details_budget = MAX_DETAILS_PER_RUN
+    list_sizes: Dict[str, Optional[int]] = {}
     if refresh:
         sess_a = smc.SMCSession(username=smc.USERNAME_2, password=smc.PASSWORD_2)
+        sess_a._portal = "requests"
+        t_phase = time.time()
         if not sess_a.login():
+            STATS["login"]["requests"] = False
             log.error("Requests-portal login failed (SMC_USERNAME_2) - aborting run.")
             upsert_uniform(RUNS_TABLE, [{"started_at": started, "finished_at": now_iso(), "ok": False,
                                           "stays_total": len(stays), "stays_checked": 0,
                                           "notes": "requests portal login failed"}], "id")
             return 1
+        STATS["login"]["requests"] = True
+        log.info("[requests portal] login OK (SMC_USERNAME_2) - reading request lists + Details pages")
         sess_a.session.get(f"{smc.BASE_URL}/smc/Requests", timeout=30)
-        for nid in sorted({s["patient_nid"] for s in refresh}):
+        nid_list = sorted({s["patient_nid"] for s in refresh})
+        for n_i, nid in enumerate(nid_list, 1):
+            if n_i == 1 or n_i % 10 == 0 or n_i == len(nid_list):
+                log.info(f"[requests portal] patient {n_i}/{len(nid_list)} | {int(time.time() - t_phase)}s elapsed | "
+                         f"{STATS['details_fetched']} Details pages read | {STATS['calls'].get('requests', 0)} calls")
             mine = [s for s in refresh if s["patient_nid"] == nid]
             from_d = min(s["check_in_date"] for s in mine) - timedelta(days=REQUEST_LOOKBACK_DAYS)
             listing = fetch_request_list(sess_a, nid, from_d, today + timedelta(days=1))
+            list_sizes[nid] = None if listing is None else len(listing)
             if listing is None:
                 for s in mine:
                     stay_errors[s["admission_id"]].append("request list could not be read")
@@ -763,9 +795,11 @@ def run():
                     (row["is_icu"] and row["status_bucket"] == "final" and not row.get("decree_number"))
                 if need_details and details_budget > 0:
                     details_budget -= 1
+                    STATS["details_fetched"] += 1
                     det = fetch_request_details(sess_a, num)
                     time.sleep(REQUEST_DELAY)
                     if det is None:
+                        STATS["details_unreadable"] += 1
                         for s in mine:
                             stay_errors[s["admission_id"]].append(f"details of request {num} not readable")
                     else:
@@ -782,6 +816,7 @@ def run():
                         letters = []
                         log.warning(f"letter lookup failed for {num}: {e}")
                     if letters:
+                        STATS["letters_read"] += 1
                         top = letters[0]
                         row["letter_date"] = to_date(top.get("committee_date"))
                         row["letter_text"] = top.get("response_text") or None
@@ -791,6 +826,9 @@ def run():
                 reqs[num] = row
                 if changed:
                     req_dirty.add(num)
+        if details_budget <= 0:
+            STATS["details_budget_exhausted"] = True
+        STATS["phase_seconds"]["requests_portal"] = int(time.time() - t_phase) if refresh else 0
 
     # assign ICU requests to stays (all tracked stays of the patient, so closed ones keep theirs)
     for nid in nids:
@@ -808,14 +846,20 @@ def run():
               and r.get("status_bucket") == "final" and r.get("decree_number")]
     if wanted:
         sess_b = smc.SMCSession(username=smc.USERNAME, password=smc.PASSWORD)
+        sess_b._portal = "decree"
+        t_b = time.time()
         if not sess_b.login():
+            STATS["login"]["decree"] = False
             log.error("Decree-portal login failed (SMC_USERNAME).")
             for adm, dnum, _ in wanted:
                 stay_errors[adm].append("decree portal login failed")
         else:
+            STATS["login"]["decree"] = True
+            log.info(f"[decree portal] login OK (SMC_USERNAME) - reading {len(wanted)} issued decree(s) + their receipts")
             for adm, dnum, rnum in wanted:
                 d = decs.get(dnum)
                 if not d or not d.get("decree_date") or d.get("decree_value") is None:
+                    STATS["decree_pages"] += 1
                     info = fetch_decree(sess_b, dnum)
                     time.sleep(REQUEST_DELAY)
                     if not info or not info["decree_date"]:
@@ -826,6 +870,7 @@ def run():
                          "procedure_text": info["procedure_text"], "details_checked_at": now_iso(),
                          "receipts_total": 0, "receipts_count": 0, "receipts_checked_at": None}
                     decs[dnum] = d; dec_dirty.add(dnum)
+                STATS["receipt_lists"] += 1
                 got = fetch_receipts(sess_b, dnum)
                 time.sleep(REQUEST_DELAY)
                 if got is None:
@@ -843,10 +888,13 @@ def run():
                     d.update({"receipts_total": tot, "receipts_count": cnt, "request_number": rnum,
                               "receipts_checked_at": now_iso()})
                     dec_dirty.add(dnum)
+        if wanted:
+            STATS["phase_seconds"]["decree_portal"] = int(time.time() - t_b)
 
     # ---------------- evaluate + persist --------------------------------
     run_ts = now_iso()
     track_rows, breach_rows = [], []
+    summaries: List[dict] = []
     for s in stays:
         adm = s["admission_id"]
         my_reqs = [r for r in reqs.values() if r.get("admission_id") == adm and r.get("is_icu")]
@@ -876,6 +924,8 @@ def run():
 
         manual = (track_db.get(adm) or {}).get("manual_status")
         computed = compute_breaches(ev["obligations"], today)
+        summaries.append({"stay": s, "ev": ev, "reqs": my_reqs, "decs": my_decs, "recs": my_recs, "errs": errs,
+                          "breaches": computed, "manual": manual, "checked": checked_now})
         keys_now = set()
         for b in computed:
             keys_now.add(b["key"])
@@ -925,11 +975,145 @@ def run():
     upsert_uniform(BREACHES_TABLE, breach_rows, "admission_id,obligation_key")
 
     failed = sum(1 for a in refresh_ids if stay_errors[a])
+    rc = report_run(stays, summaries, list_sizes, reqs, today, started)
     upsert_uniform(RUNS_TABLE, [{"started_at": started, "finished_at": now_iso(), "ok": failed == 0,
                                   "stays_total": len(stays), "stays_checked": len(refresh),
                                   "notes": f"{failed} stay(s) had SMC read errors; {len(breach_rows)} breach row(s) written"}], "id")
     log.info(f"done - {len(stays)} stays, {len(refresh)} checked, {failed} with errors, "
              f"{len(req_dirty)} requests / {len(dec_dirty)} decrees / {len(rec_dirty)} receipts / {len(breach_rows)} breaches written")
+    return rc
+
+
+# =====================================================================
+# End-of-run report: per-stay lines, funnel, problems, GitHub run summary
+# =====================================================================
+def _mask(nid: str) -> str:
+    return "***" + (nid[-4:] if nid else "????")      # logs may be visible to others: never print a full national id
+
+
+def report_run(stays, summaries, list_sizes, reqs, today, started) -> int:
+    log.info("=" * 78)
+    log.info("PER-STAY RESULT  (#admission | patient | discharge | SMC requests | decrees | billed | state)")
+    for x in sorted(summaries, key=lambda y: y["stay"]["check_out_date"]):
+        s, ev = x["stay"], x["ev"]
+        kinds: Dict[str, int] = {}
+        for r in x["reqs"]:
+            kinds[r["status_bucket"]] = kinds.get(r["status_bucket"], 0) + 1
+        req_txt = ", ".join(f"{k} {v}" for k, v in sorted(kinds.items())) or "NO ICU REQUEST FOUND"
+        dec_val = sum(float(d.get("decree_value") or 0) for d in x["decs"].values())
+        late = [f"{b['stage']}{(':' + b['ref']) if b['ref'] else ''} {b['delay_days']}d {b['status']}" for b in x["breaches"]]
+        state = ev["stage"] if not x["manual"] else f"manual-{x['manual']}"
+        due = f" next due {ev['next_due_date']}" if ev.get("next_due_date") and ev["status"] == "open" else ""
+        err = f" | READ ERRORS: {'; '.join(x['errs'])}" if x["errs"] else ""
+        log.info(f"#{s['admission_id']} {_mask(s['patient_nid'])} out {s['check_out_date']} | req: {req_txt} | "
+                 f"decrees {len(x['decs'])} ({dec_val:g}) | bill {s.get('bill_total') or '-'} billed {ev['billed_value']:g} | "
+                 f"{state}{due}{(' | late: ' + '; '.join(late)) if late else ''}{err}")
+
+    n = len(summaries)
+    with_icu = sum(1 for x in summaries if x["reqs"])
+    with_final = sum(1 for x in summaries if any(r["status_bucket"] == "final" for r in x["reqs"]))
+    with_dec = sum(1 for x in summaries if x["decs"])
+    with_rec = sum(1 for x in summaries if any(x["recs"].values()))
+    closed = sum(1 for x in summaries if x["ev"]["status"] == "closed")
+    open_delays = [b for x in summaries for b in x["breaches"] if b["status"] == "open"]
+    resolved_late = sum(1 for x in summaries for b in x["breaches"] if b["status"] == "resolved")
+    no_req_overdue = sum(1 for x in summaries if not x["reqs"] and any(b["stage"] == "first_request" for b in x["breaches"]))
+    errored = [x for x in summaries if x["errs"]]
+    zero_list = [x for x in summaries if x["checked"] and list_sizes.get(x["stay"]["patient_nid"]) == 0]
+    icu_all = [r for r in reqs.values() if r.get("is_icu")]
+    orphans = [r for r in icu_all if not r.get("admission_id")]
+    unknown_proc = [r for r in reqs.values() if r.get("is_icu") is None]
+    final_no_dec = [r for r in icu_all if r.get("status_bucket") == "final" and not r.get("decree_number")]
+    letters_missing = [r for r in icu_all if r.get("status_bucket") == "admin_letter" and not r.get("letter_checked")]
+    calls, fails = STATS["calls"], STATS["fails"]
+
+    problems: List[str] = []
+    if STATS["login"].get("requests") is False:
+        problems.append("Requests-portal login FAILED (SMC_USERNAME_2 / SMC_PASSWORD_2)")
+    if STATS["login"].get("decree") is False:
+        problems.append("Decree-portal login FAILED (SMC_USERNAME / SMC_PASSWORD)")
+    if errored:
+        problems.append(f"{len(errored)} stay(s) had SMC read errors (their SMC-side delays were NOT touched this run)")
+    if fails:
+        problems.append(f"unreadable SMC pages: {fails}  e.g. {STATS['fail_samples'][:3]}")
+    if zero_list:
+        problems.append(f"{len(zero_list)} patient(s) returned 0 requests from SMC - check the national id: "
+                        + ", ".join(f"#{x['stay']['admission_id']}({_mask(x['stay']['patient_nid'])})" for x in zero_list[:10]))
+    if orphans:
+        problems.append(f"{len(orphans)} ICU request(s) matched NO tracked stay (dates differ by more than "
+                        f"{STAY_MATCH_TOLERANCE_DAYS} days, or the stay is not category 4 / before {TRACK_FROM}): "
+                        + ", ".join(r["request_number"] for r in orphans[:8]))
+    if unknown_proc:
+        problems.append(f"{len(unknown_proc)} request(s) whose Details page was not read yet (will be retried next run)")
+    if STATS["details_budget_exhausted"]:
+        problems.append(f"Details budget ({MAX_DETAILS_PER_RUN}) exhausted - remaining requests are read on the next run")
+    if final_no_dec:
+        problems.append(f"{len(final_no_dec)} final request(s) without a decree number on the page: "
+                        + ", ".join(r["request_number"] for r in final_no_dec[:8]))
+    if letters_missing:
+        problems.append(f"{len(letters_missing)} admin-letter request(s) whose letter text/date could not be read "
+                        "(letter date falls back to the day the status was first seen)")
+
+    log.info("=" * 78)
+    log.info("RUN REPORT")
+    log.info(f"  discharged ICU stays tracked (cat {FIN_CATEGORY_ID}, >= {TRACK_FROM}) : {n}  (re-checked on SMC this run: {sum(1 for x in summaries if x['checked'])})")
+    log.info(f"  ... with at least 1 ICU request found on SMC          : {with_icu}")
+    log.info(f"  ... with a final decree request                       : {with_final}")
+    log.info(f"  ... with the issued decree's details read             : {with_dec}")
+    log.info(f"  ... with at least 1 receipt (bill) under a decree     : {with_rec}")
+    log.info(f"  ... closed (fully covered + billed)                   : {closed}   open: {n - closed}")
+    log.info(f"  ... no ICU request filed and already overdue          : {no_req_overdue}")
+    log.info(f"  delays: {len(open_delays)} still open, {resolved_late} resolved late (permanent record)")
+    log.info(f"  SMC calls  requests portal: {calls.get('requests', 0)} (failed {fails.get('requests', 0)}) | "
+             f"decree portal: {calls.get('decree', 0)} (failed {fails.get('decree', 0)})")
+    log.info(f"  read this run: {STATS['details_fetched']} request Details pages ({STATS['details_unreadable']} unreadable), "
+             f"{STATS['letters_read']} admin letters, {STATS['decree_pages']} decree pages, {STATS['receipt_lists']} receipt lists")
+    log.info(f"  phase time (s): {STATS['phase_seconds']}  | request cache: {len(reqs)} requests ({len(icu_all)} ICU)")
+    if problems:
+        for pr in problems:
+            log.warning("PROBLEM: " + pr)
+            print(f"::warning title=ICU tracker::{pr}")
+    else:
+        log.info("NO PROBLEMS DETECTED - both portals logged in and every page was read.")
+    log.info("=" * 78)
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        top = sorted(open_delays, key=lambda b: -b["delay_days"])[:15]
+        owner = {id(b): x["stay"] for x in summaries for b in x["breaches"]}
+        md = [f"## ICU billing tracker - {today.isoformat()}",
+              "| Check | Result |", "|---|---|",
+              f"| Requests portal login (SMC_USERNAME_2) | {'OK' if STATS['login'].get('requests') else ('FAILED' if STATS['login'].get('requests') is False else 'not needed')} |",
+              f"| Decree portal login (SMC_USERNAME) | {'OK' if STATS['login'].get('decree') else ('FAILED' if STATS['login'].get('decree') is False else 'not needed (no issued decree to read)')} |",
+              f"| Tracked ICU stays (category {FIN_CATEGORY_ID}, since {TRACK_FROM}) | {n} |",
+              f"| With an ICU request found on SMC | {with_icu} |",
+              f"| With a final decree request | {with_final} |",
+              f"| Decree details read | {with_dec} |",
+              f"| With receipts (bills) under a decree | {with_rec} |",
+              f"| Closed / open | {closed} / {n - closed} |",
+              f"| No request filed and overdue | {no_req_overdue} |",
+              f"| Open delays / resolved late | {len(open_delays)} / {resolved_late} |",
+              f"| SMC calls (requests / decree portal) | {calls.get('requests', 0)} / {calls.get('decree', 0)} |",
+              f"| Failed SMC calls | {sum(fails.values()) if fails else 0} |",
+              f"| Details pages read this run | {STATS['details_fetched']} |", ""]
+        md.append("### Problems" if problems else "### No problems detected")
+        md += [f"- {pr}" for pr in problems]
+        if top:
+            md += ["", "### Longest open delays", "| Admission | Patient | Stage | Reference | Days late |", "|---|---|---|---|---|"]
+            for b in top:
+                st = owner[id(b)]
+                md.append(f"| #{st['admission_id']} | {_mask(st['patient_nid'])} | {b['stage']} | {b['ref'] or '-'} | {b['delay_days']} |")
+        try:
+            with open(summary_path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(md) + "\n")
+        except OSError as e:
+            log.warning(f"could not write the run summary: {e}")
+
+    hard = STATS["login"].get("requests") is False or STATS["login"].get("decree") is False
+    ratio = (len(errored) / max(1, sum(1 for x in summaries if x["checked"])))
+    if hard or ratio >= 0.25:
+        print(f"::error title=ICU tracker::run marked FAILED ({'login failure' if hard else f'{ratio:.0%} of stays had read errors'})")
+        return 1
     return 0
 
 
