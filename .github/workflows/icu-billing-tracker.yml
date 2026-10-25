@@ -1,0 +1,131 @@
+# .github/workflows/icu-billing-tracker.yml
+# ============================================================================
+# Daily ICU billing-workflow tracker (icu_billing_tracker.py).
+#
+# WHAT IT DOES
+#   For every ICU stay of a State Fund patient (financial_categories.id = 4)
+#   discharged on/after ICU_TRACK_FROM it:
+#     1. reads the stay (patient_admissions) and its bill (icu_bills) from Supabase,
+#     2. logs in to the REQUESTS portal (SMC_USERNAME_2) and reads the patient's
+#        requests, their status (final / admin letter / cancelled / pending),
+#        the ICU proof (procid = 12) and the issued decree number,
+#     3. logs in to the DECREE portal (SMC_USERNAME) and reads each issued
+#        decree's value, date and the bills (receipts) registered under it,
+#     4. evaluates every deadline and writes the result, the permanent delay
+#        records and a run log to the icu_* tables.
+#   modules/icu-revenue-cycle.js only displays that data.
+#
+# SCHEDULE
+#   03:00 UTC = 05:00 Cairo in winter / 06:00 in summer time, i.e. before the
+#   working day, so the module shows fresh "last check" figures every morning.
+#   GitHub may start a scheduled run a few minutes late; nothing here depends on
+#   the exact minute (deadlines are whole Cairo dates), and a missed night is
+#   simply covered by the next run.
+#
+# NO PARALLEL RUNNERS
+#   The queue is small (open ICU stays of one fund category) and the script is
+#   throttled on purpose (0.3 s between SMC calls). One runner also means one
+#   login per SMC account, so there is no session clash between runners.
+#
+# REQUIRED REPOSITORY SECRETS (already set)
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+#   SMC_USERNAME_2 / SMC_PASSWORD_2   requests portal
+#   SMC_USERNAME   / SMC_PASSWORD     decree portal
+#
+# FILES THIS WORKFLOW NEEDS IN THE REPO ROOT
+#   icu_billing_tracker.py, smc_session.py, supabase_client.py,
+#   admin_letter_lookup.py (imported by the tracker), requirements.txt
+#
+# MANUAL RUN (Actions -> "ICU Billing Tracker" -> Run workflow)
+#   selftest_only = true  runs the offline logic tests and stops (no network).
+#   track_from            optional override of the first discharge date tracked.
+# ============================================================================
+
+name: ICU Billing Tracker
+
+# A manual run during the nightly one would read and write the same rows twice.
+# Queue instead; never cancel mid-run (it would stop between SMC reads and the
+# Supabase write).
+concurrency:
+  group: icu-billing-tracker
+  cancel-in-progress: false
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      selftest_only:
+        description: "true = only run the offline logic self-test (no SMC, no database)"
+        required: false
+        default: "false"
+      track_from:
+        description: "Optional: first discharge date to track, YYYY-MM-DD (default 2026-07-01)"
+        required: false
+        default: ""
+      max_details_per_run:
+        description: "Max SMC request detail pages to read in one run (default 400)"
+        required: false
+        default: "400"
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # This job only reads web pages and calls the database: requests and
+      # beautifulsoup4 are all it needs. No Playwright / Ghostscript / Chromium.
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check --quiet requests beautifulsoup4
+
+      # Pure logic tests (deadlines, Friday rule, allocation across decrees,
+      # closing rule, request-to-stay matching). If this fails the real run must
+      # not start: wrong logic would write wrong delays into the permanent record.
+      - name: Offline self-test
+        run: python icu_billing_tracker.py --selftest
+
+      - name: Run ICU billing tracker
+        if: ${{ github.event.inputs.selftest_only != 'true' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          # On the nightly schedule there are no inputs, so every value below
+          # falls back to the script's own default. They must never be an empty
+          # string where the script does int(...) / date parsing.
+          ICU_TRACK_FROM: ${{ github.event.inputs.track_from || '2026-07-01' }}
+          MAX_DETAILS_PER_RUN: ${{ github.event.inputs.max_details_per_run || '400' }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -o pipefail
+          python icu_billing_tracker.py 2>&1 | tee icu_tracker_run.log
+
+      # The run log is also written to icu_tracker_runs (what the module shows),
+      # but the full text is handy when an SMC page changes its layout.
+      - name: Upload run log
+        if: ${{ always() && github.event.inputs.selftest_only != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: icu-tracker-log-${{ github.run_id }}
+          path: icu_tracker_run.log
+          if-no-files-found: ignore
+          retention-days: 7
