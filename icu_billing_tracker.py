@@ -24,6 +24,17 @@ TWO SMC LOGINS (GitHub secrets, already set):
   SMC_USERNAME_2 / SMC_PASSWORD_2  requests portal  (request list, Details)
   SMC_USERNAME   / SMC_PASSWORD    decree portal    (decree page, receipts)
 
+HOW A DECREE REQUEST IS MATCHED TO A STAY (match_requests_to_stays):
+  * only requests on procedure 12 filed at the facility whose name contains ICU_FACILITY_KEYWORD
+    ("جوستاف") count; every other facility is ignored.
+  * only requests filed on/after the patient's OLDEST ICU discharge are looked at.
+  * ONE ICU period in the admission module: every such request belongs to it - even when the
+    admission date typed on SMC differs (any number of days). The difference is written as a note.
+    No such request -> "not found" (that is the only case it is reported as not found).
+  * SEVERAL periods: the admission dates found on SMC are grouped (+-2 days, +-1 day when two
+    periods are less than 3 days apart) and matched in order: oldest<->oldest, newest<->newest,
+    middle<->middle (best monotonic fit by date distance).
+
 Everything the module shows comes from this script's evaluate_stay(); the
 module only displays it and writes supervisor overrides (manual_*, excuse_*).
 
@@ -39,6 +50,7 @@ import json
 import time
 import logging
 import argparse
+import itertools
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -64,7 +76,13 @@ ICU_PROC_IDS = {p.strip() for p in os.environ.get("ICU_PROC_IDS", "12").split(",
 DECREE_YEAR_PREFIXES = tuple(p.strip() for p in os.environ.get("DECREE_YEAR_PREFIXES", "2026,2027,2028").split(",") if p.strip())
 REJECTED_RECEIPT_PREFIXES = tuple(p.strip().upper() for p in os.environ.get("REJECTED_RECEIPT_PREFIXES", "R").split(",") if p.strip())
 
-STAY_MATCH_TOLERANCE_DAYS = int(os.environ.get("STAY_MATCH_TOLERANCE_DAYS", "2"))
+STAY_MATCH_TOLERANCE_DAYS = int(os.environ.get("STAY_MATCH_TOLERANCE_DAYS", "2"))     # icu_bills <-> stay only
+ICU_FACILITY_KEYWORD = os.environ.get("ICU_FACILITY_KEYWORD", "جوستاف")               # only requests of this facility count
+SMC_DATE_TOLERANCE_DAYS = int(os.environ.get("SMC_DATE_TOLERANCE_DAYS", "2"))          # grouping of SMC admission dates
+SMC_DATE_TOLERANCE_TIGHT_DAYS = int(os.environ.get("SMC_DATE_TOLERANCE_TIGHT_DAYS", "1"))
+TIGHT_GAP_DAYS = int(os.environ.get("TIGHT_GAP_DAYS", "3"))                           # periods closer than this -> tight tolerance
+ICU_CONTEXT_DAYS = int(os.environ.get("ICU_CONTEXT_DAYS", "30"))                      # earlier ICU periods still counted as periods
+ICU_SERVER_PROC_FILTER = os.environ.get("ICU_SERVER_PROC_FILTER", "1") != "0"         # ask SMC for procedure 12 only (self-verified)
 BILL_DAYS_AFTER_DISCHARGE = int(os.environ.get("BILL_DAYS_AFTER_DISCHARGE", "4"))   # 3 dept + 1 RCM
 BILL_UNDER_DECREE_DAYS = int(os.environ.get("BILL_UNDER_DECREE_DAYS", "2"))
 CONTINUATION_DAYS = int(os.environ.get("CONTINUATION_DAYS", "2"))
@@ -365,26 +383,85 @@ def compute_breaches(obligations: List[dict], today: date) -> List[dict]:
     return out
 
 
+def match_requests_to_stays(requests: List[dict], stays: List[dict]) -> Tuple[Dict[str, Optional[int]], Dict[int, List[str]]]:
+    """One patient's ICU decree requests (procedure 12, right facility) vs that patient's ICU periods.
+    -> ({request_number: admission_id or None}, {admission_id: [notes]}).  See the module docstring."""
+    result: Dict[str, Optional[int]] = {r["request_number"]: None for r in requests}
+    notes: Dict[int, List[str]] = {}
+    if not stays:
+        return result, notes
+    ss = sorted(stays, key=lambda s: (s["check_in_date"], s["check_out_date"]))
+    oldest_out = ss[0]["check_out_date"]
+    cands = [r for r in requests if not r.get("request_date") or r["request_date"] >= oldest_out]
+
+    def add_note(adm, text):
+        if text not in notes.setdefault(adm, []):
+            notes[adm].append(text)
+
+    def mismatch_notes(stay, reqs_):
+        by_date: Dict[date, List[str]] = {}
+        for r in reqs_:
+            sf = r.get("smc_stay_from")
+            if sf and sf != stay["check_in_date"]:
+                by_date.setdefault(sf, []).append(r["request_number"])
+        for sf, nums in sorted(by_date.items()):
+            add_note(stay["admission_id"],
+                     f"decree request {', '.join(nums)} was found carrying admission date {sf} while the admission "
+                     f"module carries {stay['check_in_date']} ({abs((sf - stay['check_in_date']).days)} day(s) apart)")
+
+    if len(ss) == 1:                                   # one period: every request after discharge is its request
+        for r in cands:
+            result[r["request_number"]] = ss[0]["admission_id"]
+        mismatch_notes(ss[0], cands)
+        return result, notes
+
+    # ---- several periods ------------------------------------------------
+    tol = SMC_DATE_TOLERANCE_DAYS
+    for a_, b_ in zip(ss, ss[1:]):
+        if (b_["check_in_date"] - a_["check_out_date"]).days < TIGHT_GAP_DAYS:
+            tol = SMC_DATE_TOLERANCE_TIGHT_DAYS
+            break
+    dated = sorted([r for r in cands if r.get("smc_stay_from")],
+                   key=lambda r: (r["smc_stay_from"], r.get("request_date") or date.min))
+    clusters: List[dict] = []
+    for r in dated:
+        if clusters and (r["smc_stay_from"] - clusters[-1]["anchor"]).days <= tol:
+            clusters[-1]["reqs"].append(r)
+        else:
+            clusters.append({"anchor": r["smc_stay_from"], "reqs": [r]})
+
+    def cost(c, st):
+        d = abs((c["anchor"] - st["check_in_date"]).days)
+        first_req = min((x.get("request_date") or date.max) for x in c["reqs"])
+        if first_req < st["check_out_date"]:            # filed before that period even ended: unlikely pairing
+            d += 1000
+        return d
+
+    n, m = len(clusters), len(ss)
+    chosen: List[int] = []
+    if n:
+        if n <= m:                                       # oldest<->oldest ... newest<->newest, order preserved
+            best = min(itertools.combinations(range(m), n),
+                       key=lambda combo: sum(cost(clusters[i], ss[j]) for i, j in enumerate(combo)))
+            chosen = list(best)
+        else:                                            # more SMC admission dates than periods: nearest period each
+            chosen = [min(range(m), key=lambda j: (cost(c, ss[j]), -j)) for c in clusters]
+            add_note(ss[-1]["admission_id"],
+                     f"SMC holds {n} different admission dates for ICU requests but the admission module holds only {m} period(s)")
+    for c, j in zip(clusters, chosen):
+        for r in c["reqs"]:
+            result[r["request_number"]] = ss[j]["admission_id"]
+        mismatch_notes(ss[j], c["reqs"])
+    for r in cands:                                      # requests without an SMC admission date: by filing date
+        if r.get("smc_stay_from"):
+            continue
+        before = [st for st in ss if r.get("request_date") and st["check_out_date"] <= r["request_date"]]
+        result[r["request_number"]] = (before[-1] if before else ss[0])["admission_id"]
+    return result, notes
+
+
 def assign_requests_to_stays(requests: List[dict], stays: List[dict]) -> Dict[str, Optional[int]]:
-    """request_number -> admission_id (one patient's ICU requests vs that patient's stays).
-    Primary rule: SMC's own ICU stay start (ICUdata.FromDate) within +-tolerance of the app check-in
-    (closest wins). Fallback when SMC gave no dates: the latest stay checked in on/before the request."""
-    tol = timedelta(days=STAY_MATCH_TOLERANCE_DAYS)
-    result: Dict[str, Optional[int]] = {}
-    for r in requests:
-        best, best_diff = None, None
-        sf, rd = r.get("smc_stay_from"), r.get("request_date")
-        if sf:
-            for s in stays:
-                diff = abs((sf - s["check_in_date"]).days)
-                if diff <= tol.days and (best_diff is None or diff < best_diff):
-                    best, best_diff = s["admission_id"], diff
-        elif rd:
-            cands = [s for s in stays if s["check_in_date"] - tol <= rd]
-            if cands:
-                best = max(cands, key=lambda s: s["check_in_date"])["admission_id"]
-        result[r["request_number"]] = best
-    return result
+    return match_requests_to_stays(requests, stays)[0]
 
 
 # =====================================================================
@@ -430,8 +507,23 @@ def extract_decree_numbers(html: str) -> List[str]:
     return list(dict.fromkeys(found))
 
 
+def facility_ok(text: Optional[str]) -> bool:
+    return bool(text) and norm_ar(ICU_FACILITY_KEYWORD) in norm_ar(text)
+
+
 def parse_request_details(html: str) -> dict:
-    out = {"procid": None, "smc_stay_from": None, "smc_stay_to": None, "decree_number": None}
+    out = {"procid": None, "smc_stay_from": None, "smc_stay_to": None, "decree_number": None, "facility": None}
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        names = []
+        for fid in ("RecommHospitalName", "sendingSite"):          # treating facility / sending facility
+            for inp in soup.find_all("input", id=fid):
+                v = re.sub(r"\s+", " ", inp.get("value") or "").strip()
+                if v and v not in names:
+                    names.append(v)
+        out["facility"] = " | ".join(names) or None
+    except Exception as e:                                        # never let a parse problem hide a request
+        log.warning(f"facility parse failed: {e}")
     m = re.search(r"TREATMENTPROCEDUREID\s*=\s*'?(\d+)'?", html)
     if m:
         out["procid"] = m.group(1)
@@ -544,12 +636,12 @@ def _mdy(d: date) -> str:
     return f"{d.month:02d}-{d.day:02d}-{d.year}"
 
 
-def fetch_request_list(sess, nid: str, from_d: date, to_d: date) -> Optional[List[dict]]:
+def fetch_request_list(sess, nid: str, from_d: date, to_d: date, proc_id: str = "") -> Optional[List[dict]]:
     """All requests of one patient in the window (pages followed). None = could not read."""
     url = f"{smc.BASE_URL}/smc/Requests/GetRequests"
     seen, rows = set(), []
     for page in range(1, 9):
-        payload = {"requestId": "", "nationalId": nid, "REQUESTIMPORTANCEID": "", "TreatmentProcdId": "",
+        payload = {"requestId": "", "nationalId": nid, "REQUESTIMPORTANCEID": "", "TreatmentProcdId": proc_id,
                    "patientName": "", "fromDate": _mdy(from_d), "toDate": _mdy(to_d), "recommendHosId": "",
                    "statusId": "", "cancerCase": "false", "source": "", "page": str(page)}
         resp = smc_request(sess, "POST", url, data=payload,
@@ -565,6 +657,25 @@ def fetch_request_list(sess, nid: str, from_d: date, to_d: date) -> Optional[Lis
             rows.append(g)
         time.sleep(REQUEST_DELAY)
     return rows
+
+
+def fetch_icu_request_list(sess, nid: str, from_d: date, to_d: date, probe: dict):
+    """-> (listing, ids returned by the procedure-filtered query or None).
+    The server-side procedure filter is only trusted after it was cross-checked against Details pages
+    (probe state True); until then the full list is read, so nothing can be hidden by a misbehaving filter."""
+    if probe["state"] is False:
+        return fetch_request_list(sess, nid, from_d, to_d), None
+    filt: Dict[str, dict] = {}
+    for pid in sorted(ICU_PROC_IDS):
+        got = fetch_request_list(sess, nid, from_d, to_d, proc_id=pid)
+        if got is None:
+            return (fetch_request_list(sess, nid, from_d, to_d), None) if probe["state"] is None else (None, None)
+        for g in got:
+            filt[g["request_number"]] = g
+    if probe["state"] is True:
+        return list(filt.values()), set(filt)
+    full = fetch_request_list(sess, nid, from_d, to_d)
+    return full, (set(filt) if full is not None else None)
 
 
 def fetch_request_details(sess, request_number: str) -> Optional[dict]:
@@ -623,7 +734,10 @@ def fetch_in(table: str, select: str, col: str, values: List[str], extra: str = 
 
 
 def load_icu_stays() -> List[dict]:
+    """Every ICU period discharged since TRACK_FROM - ICU_CONTEXT_DAYS. Only periods discharged on/after
+    TRACK_FROM are 'in_scope' (tracked); the earlier ones just count as extra periods of the same patient."""
     import supabase_client as sb
+    context_from = (to_date(TRACK_FROM) or date(2026, 7, 1)) - timedelta(days=ICU_CONTEXT_DAYS)
     depts = sb.fetch_all("departments", "id,name_ar")
     icu = next((d for d in depts if (d.get("name_ar") or "").strip() == ICU_DEPARTMENT_NAME), None)
     if not icu:
@@ -631,7 +745,7 @@ def load_icu_stays() -> List[dict]:
     rows = sb.fetch_all(
         "patient_admissions",
         "id,patient_id,check_in_date,check_out_date,departure_type,financial_category_id,patients(name,national_id)",
-        f"department_id=eq.{icu['id']}&check_out_date=gte.{TRACK_FROM}")
+        f"department_id=eq.{icu['id']}&check_out_date=gte.{context_from.isoformat()}")
     stays = []
     for r in rows:
         p = r.get("patients") or {}
@@ -643,7 +757,8 @@ def load_icu_stays() -> List[dict]:
             continue
         stays.append({"admission_id": r["id"], "patient_id": r.get("patient_id"), "patient_nid": nid,
                       "patient_name": (p.get("name") or "").strip(), "check_in_date": ci, "check_out_date": co,
-                      "departure_type": r.get("departure_type"), "financial_category_id": r.get("financial_category_id")})
+                      "departure_type": r.get("departure_type"), "financial_category_id": r.get("financial_category_id"),
+                      "in_scope": co >= (to_date(TRACK_FROM) or date.min)})
     return stays
 
 
@@ -702,9 +817,19 @@ def run():
     reset_stats()
     started = now_iso()
     today = today_cairo()
-    stays = load_icu_stays()
-    attach_bills(stays)
-    stays = [s for s in stays if qualifies(s)]
+    all_stays = load_icu_stays()
+    scope = [s for s in all_stays if s["in_scope"]]
+    attach_bills(scope)
+    stays = [s for s in scope if qualifies(s)]
+    # every ICU period of the tracked patients (earlier ones included): decides single- vs multi-period matching
+    tracked_nids = {s["patient_nid"] for s in stays}
+    nid_stays: Dict[str, List[dict]] = {}
+    for s in all_stays:
+        if s["patient_nid"] in tracked_nids:
+            nid_stays.setdefault(s["patient_nid"], []).append(s)
+    # requests are only looked at from the patient's OLDEST period discharge onward
+    gate_by_nid = {n: sorted(v, key=lambda x: (x["check_in_date"], x["check_out_date"]))[0]["check_out_date"]
+                   for n, v in nid_stays.items()}
     log.info(f"{len(stays)} qualifying ICU stay(s) discharged on/after {TRACK_FROM}")
     if not stays:
         upsert_uniform(RUNS_TABLE, [{"started_at": started, "finished_at": now_iso(), "ok": True,
@@ -726,6 +851,15 @@ def run():
     refresh = [s for s in stays if needs_refresh(s)]
     stay_errors: Dict[int, List[str]] = {s["admission_id"]: [] for s in stays}
     log.info(f"{len(refresh)} open stay(s) will be re-checked on SMC")
+
+    # the facility column is new: run icu_stay_requests_facility.sql once; until then it is re-read each run
+    try:
+        sb.fetch_all(REQUESTS_TABLE, "facility", "limit=1")
+        facility_col = True
+    except Exception:
+        facility_col = False
+        log.warning("icu_stay_requests.facility column missing - run icu_stay_requests_facility.sql "
+                    "(facility is re-read from SMC every run until then)")
 
     # in-memory fact tables (db rows normalised to python types)
     def norm_req(r):
@@ -762,25 +896,33 @@ def run():
         log.info("[requests portal] login OK (SMC_USERNAME_2) - reading request lists + Details pages")
         sess_a.session.get(f"{smc.BASE_URL}/smc/Requests", timeout=30)
         nid_list = sorted({s["patient_nid"] for s in refresh})
+        probe = {"state": None if ICU_SERVER_PROC_FILTER else False, "verified": 0, "tried": 0}
+        unread_by_nid: Dict[str, int] = {}
         for n_i, nid in enumerate(nid_list, 1):
             if n_i == 1 or n_i % 10 == 0 or n_i == len(nid_list):
                 log.info(f"[requests portal] patient {n_i}/{len(nid_list)} | {int(time.time() - t_phase)}s elapsed | "
                          f"{STATS['details_fetched']} Details pages read | {STATS['calls'].get('requests', 0)} calls")
             mine = [s for s in refresh if s["patient_nid"] == nid]
-            from_d = min(s["check_in_date"] for s in mine) - timedelta(days=REQUEST_LOOKBACK_DAYS)
-            listing = fetch_request_list(sess_a, nid, from_d, today + timedelta(days=1))
+            ctx = nid_stays.get(nid) or mine
+            from_d = min(s["check_in_date"] for s in ctx) - timedelta(days=REQUEST_LOOKBACK_DAYS)
+            gate = gate_by_nid.get(nid)
+            listing, filt_ids = fetch_icu_request_list(sess_a, nid, from_d, today + timedelta(days=1), probe)
             list_sizes[nid] = None if listing is None else len(listing)
             if listing is None:
                 for s in mine:
                     stay_errors[s["admission_id"]].append("request list could not be read")
                 continue
+            seen_nums = []
             for item in listing:
                 num = item["request_number"]
+                if gate and item["request_date"] and item["request_date"] < gate:
+                    continue            # filed before the patient's oldest ICU discharge: cannot be the decree request
+                seen_nums.append(num)
                 row = reqs.get(num) or {"request_number": num, "patient_nid": nid, "admission_id": None,
-                                        "procid": None, "is_icu": None, "smc_stay_from": None, "smc_stay_to": None,
-                                        "decree_number": None, "letter_date": None, "letter_text": None,
-                                        "letter_checked": False, "status_seen_on": today, "status_text": None,
-                                        "status_bucket": None, "first_seen_at": now_iso()}
+                                        "procid": None, "is_icu": None, "facility": None, "smc_stay_from": None,
+                                        "smc_stay_to": None, "decree_number": None, "letter_date": None,
+                                        "letter_text": None, "letter_checked": False, "status_seen_on": today,
+                                        "status_text": None, "status_bucket": None, "first_seen_at": now_iso()}
                 changed = num not in reqs
                 if row.get("status_text") != item["status_text"]:
                     if row.get("status_text") is not None:
@@ -791,8 +933,9 @@ def run():
                     changed = True
                 if row.get("request_date") != item["request_date"]:
                     row["request_date"] = item["request_date"]; changed = True
-                need_details = row["is_icu"] is None or \
-                    (row["is_icu"] and row["status_bucket"] == "final" and not row.get("decree_number"))
+                need_details = (row["is_icu"] is None
+                                or (row.get("procid") in ICU_PROC_IDS and not row.get("facility"))
+                                or (row["is_icu"] and row["status_bucket"] == "final" and not row.get("decree_number")))
                 if need_details and details_budget > 0:
                     details_budget -= 1
                     STATS["details_fetched"] += 1
@@ -804,11 +947,24 @@ def run():
                             stay_errors[s["admission_id"]].append(f"details of request {num} not readable")
                     else:
                         row["procid"] = det["procid"]
-                        row["is_icu"] = (det["procid"] in ICU_PROC_IDS) if det["procid"] else None
+                        row["facility"] = det.get("facility")
+                        proc_ok = (det["procid"] in ICU_PROC_IDS) if det["procid"] else None
+                        if proc_ok is None:
+                            row["is_icu"] = None
+                        elif not proc_ok:
+                            row["is_icu"] = False
+                        elif not row["facility"]:
+                            row["is_icu"] = None
+                            for s in mine:
+                                stay_errors[s["admission_id"]].append(f"facility of request {num} not readable")
+                        else:
+                            row["is_icu"] = facility_ok(row["facility"])    # procedure 12 AND the right facility
                         row["smc_stay_from"], row["smc_stay_to"] = det["smc_stay_from"], det["smc_stay_to"]
                         if det["decree_number"]:
                             row["decree_number"] = det["decree_number"]
                         changed = True
+                elif need_details:
+                    unread_by_nid[nid] = unread_by_nid.get(nid, 0) + 1
                 if row["is_icu"] and row["status_bucket"] == "admin_letter" and not row.get("letter_checked"):
                     try:
                         letters = alu.get_letters_for_request(sess_a, num)
@@ -826,18 +982,54 @@ def run():
                 reqs[num] = row
                 if changed:
                     req_dirty.add(num)
+            if unread_by_nid.get(nid):
+                for s in mine:
+                    stay_errors[s["admission_id"]].append(
+                        f"{unread_by_nid[nid]} request(s) after discharge not read yet (Details budget) - "
+                        "ICU request lookup incomplete, nothing is reported as 'not found' until it is read")
+            # while probing: the SMC procedure filter is trusted only if it agrees with the Details pages
+            if filt_ids is not None and probe["state"] is None:
+                probe["tried"] += 1
+                known = [n_ for n_ in seen_nums if reqs[n_].get("procid")]
+                if len(known) == len(seen_nums) and len(filt_ids) < len(listing):
+                    icu_by_details = {n_ for n_ in seen_nums if reqs[n_]["procid"] in ICU_PROC_IDS}
+                    after_gate = {n_ for n_ in filt_ids if n_ in set(seen_nums)}
+                    if icu_by_details == after_gate:
+                        probe["verified"] += 1
+                    else:
+                        probe["state"] = False
+                        log.warning("SMC procedure filter disagrees with the Details pages - filter disabled, "
+                                    "reading Details after the discharge date instead")
+                if probe["state"] is None and probe["verified"] >= 3:
+                    probe["state"] = True
+                    log.info("SMC procedure filter verified on 3 patients - ICU request lists are now filtered server-side")
+                elif probe["state"] is None and probe["tried"] >= 10:
+                    probe["state"] = False
+                    log.info("SMC procedure filter could not be verified - using the full request list")
+        STATS["proc_filter"] = probe["state"]
+        STATS["details_unread"] = sum(unread_by_nid.values())
         if details_budget <= 0:
             STATS["details_budget_exhausted"] = True
         STATS["phase_seconds"]["requests_portal"] = int(time.time() - t_phase) if refresh else 0
 
-    # assign ICU requests to stays (all tracked stays of the patient, so closed ones keep theirs)
+    # assign ICU requests to stays (see match_requests_to_stays); notes carry any admission-date difference
+    scope_ids = {s["admission_id"] for s in stays}
+    match_notes: Dict[int, List[str]] = {}
     for nid in nids:
-        mine_stays = [s for s in stays if s["patient_nid"] == nid]
         icu_reqs = [r for r in reqs.values() if r["patient_nid"] == nid and r.get("is_icu")]
-        for num, adm in assign_requests_to_stays(icu_reqs, mine_stays).items():
+        mapping, notes = match_requests_to_stays(icu_reqs, nid_stays.get(nid, []))
+        for num, adm in mapping.items():
+            adm = adm if adm in scope_ids else None        # earlier (out-of-scope) periods are not tracked rows
             if reqs[num].get("admission_id") != adm:
                 reqs[num]["admission_id"] = adm
                 req_dirty.add(num)
+        for adm, texts in notes.items():
+            if adm in scope_ids:
+                match_notes.setdefault(adm, []).extend(texts)
+    # which requests are relevant (filed on/after the patient's oldest ICU discharge) - for the end-of-run report
+    for r in reqs.values():
+        g = gate_by_nid.get(r["patient_nid"])
+        r["_relevant"] = bool(g is None or not r.get("request_date") or r["request_date"] >= g)
 
     # ---------------- decree portal -------------------------------------
     refresh_ids = {s["admission_id"] for s in refresh}
@@ -918,7 +1110,7 @@ def run():
                "remaining_to_cover": ev["remaining_to_cover"], "requests_count": ev["requests_count"],
                "smc_summary": ev["smc_summary"], "updated_at": run_ts}
         if checked_now:
-            note = "; ".join(errs + ev["notes"])[:900] or None
+            note = "; ".join(errs + ev["notes"] + match_notes.get(adm, []))[:900] or None
             row.update({"last_checked_at": run_ts, "last_check_ok": not errs, "last_check_note": note})
         track_rows.append(row)
 
@@ -963,7 +1155,7 @@ def run():
     # parents first (FKs): tracking -> requests -> decrees -> receipts -> breaches
     upsert_uniform(TRACKING_TABLE, track_rows, "admission_id")
     req_cols = ["request_number", "patient_nid", "admission_id", "request_date", "status_text", "status_bucket",
-                "status_seen_on", "procid", "is_icu", "smc_stay_from", "smc_stay_to", "decree_number",
+                "status_seen_on", "procid", "is_icu"] + (["facility"] if facility_col else []) + [ "smc_stay_from", "smc_stay_to", "decree_number",
                 "letter_date", "letter_text", "letter_checked", "last_checked_at"]
     upsert_uniform(REQUESTS_TABLE, [{k: reqs[n].get(k) for k in req_cols} for n in req_dirty], "request_number")
     dec_cols = ["decree_number", "admission_id", "request_number", "decree_date", "decree_value", "procedure_text",
@@ -1022,7 +1214,7 @@ def report_run(stays, summaries, list_sizes, reqs, today, started) -> int:
     zero_list = [x for x in summaries if x["checked"] and list_sizes.get(x["stay"]["patient_nid"]) == 0]
     icu_all = [r for r in reqs.values() if r.get("is_icu")]
     orphans = [r for r in icu_all if not r.get("admission_id")]
-    unknown_proc = [r for r in reqs.values() if r.get("is_icu") is None]
+    unknown_proc = [r for r in reqs.values() if r.get("is_icu") is None and r.get("_relevant", True)]
     final_no_dec = [r for r in icu_all if r.get("status_bucket") == "final" and not r.get("decree_number")]
     letters_missing = [r for r in icu_all if r.get("status_bucket") == "admin_letter" and not r.get("letter_checked")]
     calls, fails = STATS["calls"], STATS["fails"]
@@ -1040,11 +1232,12 @@ def report_run(stays, summaries, list_sizes, reqs, today, started) -> int:
         problems.append(f"{len(zero_list)} patient(s) returned 0 requests from SMC - check the national id: "
                         + ", ".join(f"#{x['stay']['admission_id']}({_mask(x['stay']['patient_nid'])})" for x in zero_list[:10]))
     if orphans:
-        problems.append(f"{len(orphans)} ICU request(s) matched NO tracked stay (dates differ by more than "
-                        f"{STAY_MATCH_TOLERANCE_DAYS} days, or the stay is not category 4 / before {TRACK_FROM}): "
-                        + ", ".join(r["request_number"] for r in orphans[:8]))
+        log.info(f"  {len(orphans)} ICU request(s) of the right facility belong to a patient period that is not tracked "
+                 f"(earlier than {TRACK_FROM} or another financial category) - ignored: "
+                 + ", ".join(r["request_number"] for r in orphans[:8]))
     if unknown_proc:
-        problems.append(f"{len(unknown_proc)} request(s) whose Details page was not read yet (will be retried next run)")
+        problems.append(f"{len(unknown_proc)} request(s) filed after a discharge whose Details page was not read yet (retried next run; "
+                        "the affected stays are NOT reported as 'not found' meanwhile)")
     if STATS["details_budget_exhausted"]:
         problems.append(f"Details budget ({MAX_DETAILS_PER_RUN}) exhausted - remaining requests are read on the next run")
     if final_no_dec:
@@ -1068,6 +1261,7 @@ def report_run(stays, summaries, list_sizes, reqs, today, started) -> int:
              f"decree portal: {calls.get('decree', 0)} (failed {fails.get('decree', 0)})")
     log.info(f"  read this run: {STATS['details_fetched']} request Details pages ({STATS['details_unreadable']} unreadable), "
              f"{STATS['letters_read']} admin letters, {STATS['decree_pages']} decree pages, {STATS['receipt_lists']} receipt lists")
+    log.info(f"  SMC procedure filter: {STATS.get('proc_filter')} | details left unread: {STATS.get('details_unread', 0)}")
     log.info(f"  phase time (s): {STATS['phase_seconds']}  | request cache: {len(reqs)} requests ({len(icu_all)} ICU)")
     if problems:
         for pr in problems:
@@ -1171,11 +1365,45 @@ def _selftest_full():
     # 7) cancelled request is always flagged
     ev = evaluate_stay(base, [req("1", D(2026, 10, 9), "cancelled", seen=D(2026, 10, 10))], {}, {}, D(2026, 10, 10))
     assert any(b["stage"] == "cancelled_request" for b in compute_breaches(ev["obligations"], D(2026, 10, 10)))
-    # 8) stay <-> request matching with 1-day SMC date drift and a readmission
-    stays = [{"admission_id": 1, "check_in_date": D(2026, 9, 1)}, {"admission_id": 2, "check_in_date": D(2026, 10, 4)}]
-    m = assign_requests_to_stays([{"request_number": "a", "smc_stay_from": D(2026, 10, 5), "request_date": D(2026, 10, 13)},
-                                  {"request_number": "b", "smc_stay_from": D(2026, 8, 31), "request_date": D(2026, 9, 9)}], stays)
-    assert m == {"a": 2, "b": 1}, m
+    # 8) stay <-> request matching ------------------------------------------------
+    R = lambda n, rd, sf: {"request_number": n, "request_date": rd, "smc_stay_from": sf}
+    S = lambda i, ci, co: {"admission_id": i, "check_in_date": ci, "check_out_date": co}
+    #  8a) ONE period, SMC admission date 2 days off (the old "not found" bug) -> caught, with a note
+    one = [S(1, D(2026, 10, 4), D(2026, 10, 9))]
+    m, nt = match_requests_to_stays([R("a", D(2026, 10, 13), D(2026, 10, 2))], one)
+    assert m == {"a": 1} and "carrying admission date 2026-10-02" in nt[1][0] and "2026-10-04" in nt[1][0], (m, nt)
+    #  8b) ONE period, SMC date 20 days off -> still the one we seek
+    m, _ = match_requests_to_stays([R("a", D(2026, 10, 13), D(2026, 9, 14))], one)
+    assert m == {"a": 1}, m
+    #  8c) ONE period, same date -> no note;  request filed BEFORE discharge -> ignored
+    m, nt = match_requests_to_stays([R("a", D(2026, 10, 13), D(2026, 10, 4)), R("b", D(2026, 10, 6), D(2026, 10, 4))], one)
+    assert m == {"a": 1, "b": None} and not nt, (m, nt)
+    #  8d) no request after discharge -> nothing assigned (the only genuine "not found")
+    m, _ = match_requests_to_stays([R("b", D(2026, 10, 6), D(2026, 10, 4))], one)
+    assert m == {"b": None}
+    #  8e) TWO periods, both SMC dates drift by 2 days
+    two = [S(1, D(2026, 9, 1), D(2026, 9, 5)), S(2, D(2026, 10, 4), D(2026, 10, 9))]
+    m, _ = match_requests_to_stays([R("x", D(2026, 10, 13), D(2026, 10, 6)), R("y", D(2026, 9, 9), D(2026, 8, 30))], two)
+    assert m == {"x": 2, "y": 1}, m
+    #  8f) THREE periods 2 days apart (tight tolerance 1): oldest/middle/newest matched in order
+    three = [S(1, D(2026, 9, 1), D(2026, 9, 5)), S(2, D(2026, 9, 7), D(2026, 9, 12)), S(3, D(2026, 9, 14), D(2026, 9, 20))]
+    reqs3 = [R("a", D(2026, 9, 8), D(2026, 9, 1)), R("b", D(2026, 9, 15), D(2026, 9, 8)), R("c", D(2026, 9, 25), D(2026, 9, 13))]
+    m, nt = match_requests_to_stays(reqs3, three)
+    assert m == {"a": 1, "b": 2, "c": 3}, m
+    assert any("2026-09-08" in t and "2026-09-07" in t for t in nt[2]), nt
+    #  8g) THREE periods but SMC holds only two admission dates -> oldest and newest; middle has none
+    m, _ = match_requests_to_stays([R("a", D(2026, 9, 8), D(2026, 9, 2)), R("c", D(2026, 9, 25), D(2026, 9, 15))], three)
+    assert m == {"a": 1, "c": 3}, m
+    #  8h) several requests (admin letter chain) of the same period all follow it
+    m, _ = match_requests_to_stays([R("a", D(2026, 9, 8), D(2026, 9, 3)), R("b", D(2026, 9, 12), D(2026, 9, 3)),
+                                    R("c", D(2026, 9, 25), D(2026, 9, 13))], three)
+    assert m == {"a": 1, "b": 1, "c": 3}, m
+    #  8i) FOUR periods are handled the same way
+    four = three + [S(4, D(2026, 9, 25), D(2026, 9, 30))]
+    m, _ = match_requests_to_stays([R("a", D(2026, 9, 8), D(2026, 9, 1)), R("d", D(2026, 10, 3), D(2026, 9, 26))], four)
+    assert m == {"a": 1, "d": 4}, m
+    #  8j) facility rule
+    assert facility_ok(" جوستاف روسي انترناشيونال - مصر (EPE) *") and not facility_ok("مستشفى آخر")
     # 9) status buckets
     assert status_bucket("قرار نهائى") == "final" and status_bucket("قرار نهائي") == "final"
     assert status_bucket("خطاب ادارى") == "admin_letter" and status_bucket("خطاب إداري") == "admin_letter"
