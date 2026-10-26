@@ -51,6 +51,7 @@ import time
 import logging
 import argparse
 import itertools
+import zlib
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -82,6 +83,9 @@ SMC_DATE_TOLERANCE_DAYS = int(os.environ.get("SMC_DATE_TOLERANCE_DAYS", "2"))   
 SMC_DATE_TOLERANCE_TIGHT_DAYS = int(os.environ.get("SMC_DATE_TOLERANCE_TIGHT_DAYS", "1"))
 TIGHT_GAP_DAYS = int(os.environ.get("TIGHT_GAP_DAYS", "3"))                           # periods closer than this -> tight tolerance
 ICU_CONTEXT_DAYS = int(os.environ.get("ICU_CONTEXT_DAYS", "30"))                      # earlier ICU periods still counted as periods
+# parallel runners: runner i of N handles only the patients whose national id hashes to i (all stays of a patient stay together)
+SHARD_TOTAL = max(1, int(os.environ.get("ICU_SHARD_TOTAL", "1") or "1"))
+SHARD_INDEX = int(os.environ.get("ICU_SHARD_INDEX", "0") or "0")
 ICU_SERVER_PROC_FILTER = os.environ.get("ICU_SERVER_PROC_FILTER", "1") != "0"         # ask SMC for procedure 12 only (self-verified)
 BILL_DAYS_AFTER_DISCHARGE = int(os.environ.get("BILL_DAYS_AFTER_DISCHARGE", "4"))   # 3 dept + 1 RCM
 BILL_UNDER_DECREE_DAYS = int(os.environ.get("BILL_UNDER_DECREE_DAYS", "2"))
@@ -175,6 +179,13 @@ def to_float(value) -> Optional[float]:
 
 def digits(value) -> str:
     return re.sub(r"\D", "", ar2en(value))
+
+
+def shard_map(nids, total: int = 0) -> Dict[str, int]:
+    """Even split: patients sorted by national id, dealt round-robin (shard sizes differ by at most 1).
+    Every runner loads the same stays, so every runner computes the same map."""
+    total = total or SHARD_TOTAL
+    return {n: i % total for i, n in enumerate(sorted(set(nids)))}
 
 
 def iso(d: Optional[date]) -> Optional[str]:
@@ -821,6 +832,11 @@ def run():
     scope = [s for s in all_stays if s["in_scope"]]
     attach_bills(scope)
     stays = [s for s in scope if qualifies(s)]
+    if SHARD_TOTAL > 1:
+        total_q = len(stays)
+        mine_nids = {n for n, k in shard_map(s["patient_nid"] for s in stays).items() if k == SHARD_INDEX}
+        stays = [s for s in stays if s["patient_nid"] in mine_nids]
+        log.info(f"shard {SHARD_INDEX + 1}/{SHARD_TOTAL}: {len(stays)} of {total_q} qualifying stay(s) belong to this runner")
     # every ICU period of the tracked patients (earlier ones included): decides single- vs multi-period matching
     tracked_nids = {s["patient_nid"] for s in stays}
     nid_stays: Dict[str, List[dict]] = {}
@@ -833,7 +849,8 @@ def run():
     log.info(f"{len(stays)} qualifying ICU stay(s) discharged on/after {TRACK_FROM}")
     if not stays:
         upsert_uniform(RUNS_TABLE, [{"started_at": started, "finished_at": now_iso(), "ok": True,
-                                      "stays_total": 0, "stays_checked": 0, "notes": "no qualifying stays"}], "id")
+                                      "stays_total": 0, "stays_checked": 0,
+                                      "notes": "no qualifying stays" + (f" (shard {SHARD_INDEX + 1}/{SHARD_TOTAL})" if SHARD_TOTAL > 1 else "")}], "id")
         return 0
 
     adm_ids = [str(s["admission_id"]) for s in stays]
@@ -1170,7 +1187,8 @@ def run():
     rc = report_run(stays, summaries, list_sizes, reqs, today, started)
     upsert_uniform(RUNS_TABLE, [{"started_at": started, "finished_at": now_iso(), "ok": failed == 0,
                                   "stays_total": len(stays), "stays_checked": len(refresh),
-                                  "notes": f"{failed} stay(s) had SMC read errors; {len(breach_rows)} breach row(s) written"}], "id")
+                                  "notes": (f"[shard {SHARD_INDEX + 1}/{SHARD_TOTAL}] " if SHARD_TOTAL > 1 else "")
+                                           + f"{failed} stay(s) had SMC read errors; {len(breach_rows)} breach row(s) written"}], "id")
     log.info(f"done - {len(stays)} stays, {len(refresh)} checked, {failed} with errors, "
              f"{len(req_dirty)} requests / {len(dec_dirty)} decrees / {len(rec_dirty)} receipts / {len(breach_rows)} breaches written")
     return rc
@@ -1275,7 +1293,7 @@ def report_run(stays, summaries, list_sizes, reqs, today, started) -> int:
     if summary_path:
         top = sorted(open_delays, key=lambda b: -b["delay_days"])[:15]
         owner = {id(b): x["stay"] for x in summaries for b in x["breaches"]}
-        md = [f"## ICU billing tracker - {today.isoformat()}",
+        md = [f"## ICU billing tracker - {today.isoformat()}" + (f" - shard {SHARD_INDEX + 1}/{SHARD_TOTAL}" if SHARD_TOTAL > 1 else ""),
               "| Check | Result |", "|---|---|",
               f"| Requests portal login (SMC_USERNAME_2) | {'OK' if STATS['login'].get('requests') else ('FAILED' if STATS['login'].get('requests') is False else 'not needed')} |",
               f"| Decree portal login (SMC_USERNAME) | {'OK' if STATS['login'].get('decree') else ('FAILED' if STATS['login'].get('decree') is False else 'not needed (no issued decree to read)')} |",
@@ -1419,6 +1437,12 @@ def main():
         assert add_work_days(date(2026, 10, 5), 4) == date(2026, 10, 10)
         assert add_work_days(date(2026, 10, 8), 1) == date(2026, 10, 10)
         _selftest_full()
+        ids = [f"2670226220{n:04d}" for n in range(74)]            # sharding: each patient on exactly one runner, evenly
+        for tot in (1, 7, 20):
+            sizes = [0] * tot
+            for k in shard_map(ids, tot).values():
+                sizes[k] += 1
+            assert sum(sizes) == len(ids) and max(sizes) - min(sizes) <= 1, sizes
         print("selftest OK")
         return 0
     return run()
