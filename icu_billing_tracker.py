@@ -360,6 +360,16 @@ def evaluate_stay(stay: dict, requests: List[dict], decrees: Dict[str, dict],
             stage = "data_pending" if data_missing else "awaiting_smc"
             next_stage, next_due = None, None
 
+    # A stay whose LAST request got an administrative letter needs a NEW request: it is filed under the
+    # continuation-request stage, never under "awaiting_smc". (obligation keys/breaches keep 'admin_letter')
+    if status == "open" and chain and chain[-1]["status_bucket"] == "admin_letter":
+        if stage in ("awaiting_smc", "data_pending"):
+            stage = "continuation_request"
+    if stage == "admin_letter":
+        stage = "continuation_request"
+    if next_stage == "admin_letter":
+        next_stage = "continuation_request"
+
     if not chain:
         summary = "no_request"
     else:
@@ -765,6 +775,8 @@ def load_icu_stays() -> List[dict]:
         ci, co = to_date(r.get("check_in_date")), to_date(r.get("check_out_date"))
         nid = digits(p.get("national_id"))
         if not (ci and co and nid):
+            if ci and co:
+                log.warning(f"ICU admission #{r['id']} skipped: patient has no national id")
             continue
         stays.append({"admission_id": r["id"], "patient_id": r.get("patient_id"), "patient_nid": nid,
                       "patient_name": (p.get("name") or "").strip(), "check_in_date": ci, "check_out_date": co,
@@ -832,6 +844,8 @@ def run():
     scope = [s for s in all_stays if s["in_scope"]]
     attach_bills(scope)
     stays = [s for s in scope if qualifies(s)]
+    log.info(f"{len(scope)} ICU stay(s) discharged since {TRACK_FROM}: {len(stays)} are financial category {FIN_CATEGORY_ID} (tracked), "
+             f"{len(scope) - len(stays)} are other / unset categories (not tracked)")
     if SHARD_TOTAL > 1:
         total_q = len(stays)
         mine_nids = {n for n, k in shard_map(s["patient_nid"] for s in stays).items() if k == SHARD_INDEX}
@@ -1359,6 +1373,13 @@ def _selftest_full():
     br = {b["key"]: b for b in compute_breaches(ev["obligations"], D(2026, 10, 16))}
     assert br["admin_letter:1"]["status"] == "resolved" and br["admin_letter:1"]["delay_days"] == 3, br   # due Mon 12 -> done Thu 15
     assert ev["stage"] == "awaiting_smc"
+    # 3b) admin letter on the LAST request (first or continuation) -> needs a new request, not "awaiting"
+    ev = evaluate_stay(base, [req("1", D(2026, 10, 9), "admin_letter", letter=D(2026, 10, 11))], {}, {}, D(2026, 10, 11))
+    assert ev["stage"] == "continuation_request", ev["stage"]
+    reqs = [req("1", D(2026, 10, 9), "final", dec="2026A"), req("2", D(2026, 10, 13), "admin_letter", letter=D(2026, 10, 14))]
+    dcs = {"2026A": {"decree_number": "2026A", "request_number": "1", "decree_date": D(2026, 10, 12), "decree_value": 1000.0}}
+    ev = evaluate_stay(base, reqs, dcs, {"2026A": [{"receipt_id": "9", "registered_on": D(2026, 10, 13), "value": 1000.0, "counted": True}]}, D(2026, 10, 15))
+    assert ev["stage"] == "continuation_request" and ev["smc_summary"] == "admin_letter", ev["stage"]
     # 4) partial decree (1000 of 3000): billing + continuation both overdue
     reqs = [req("1", D(2026, 10, 9), "final", dec="2026A")]
     decs = {"2026A": {"decree_number": "2026A", "request_number": "1", "decree_date": D(2026, 10, 12), "decree_value": 1000.0}}
