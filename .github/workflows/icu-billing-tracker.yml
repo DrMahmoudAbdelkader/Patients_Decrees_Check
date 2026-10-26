@@ -2,6 +2,9 @@
 # Runs icu_billing_tracker.py twice a day so a 24h/48h deadline is never detected
 # more than ~half a day late. Cairo is UTC+2 (UTC+3 in summer): 05:00 and 13:00 UTC
 # land at roughly 07-08 and 15-16 Cairo time.
+#
+# The patients are split over N parallel runners (default 20). Runner i handles patient
+# number i, i+N, i+2N ... of the sorted national-id list, so all stays of a patient stay together.
 name: ICU billing tracker
 
 on:
@@ -13,15 +16,22 @@ on:
         description: "Override ICU_TRACK_FROM (YYYY-MM-DD). Leave empty for 2026-07-01."
         required: false
         default: ""
+      shards:
+        description: "Number of parallel runners (1-20)."
+        required: false
+        default: "20"
 
 concurrency:
   group: icu-billing-tracker
   cancel-in-progress: false
 
 jobs:
-  track:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      total: ${{ steps.m.outputs.total }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,8 +43,41 @@ jobs:
       - name: Install dependencies
         run: pip install requests beautifulsoup4 tzdata
 
+      # the logic test runs once here, not on every runner
       - name: Offline logic self-test
         run: python icu_billing_tracker.py --selftest
+
+      - name: Build shard matrix
+        id: m
+        env:
+          SHARDS_INPUT: ${{ github.event.inputs.shards }}
+        run: |
+          n="${SHARDS_INPUT:-20}"
+          case "$n" in ''|*[!0-9]*) n=20;; esac
+          [ "$n" -lt 1 ] && n=1
+          [ "$n" -gt 20 ] && n=20
+          echo "total=$n" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(python -c "import json;print(json.dumps(list(range($n))))")" >> "$GITHUB_OUTPUT"
+
+  track:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false            # one runner failing must never stop the others
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    name: track (shard ${{ matrix.shard }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 tzdata
 
       - name: Run tracker
         env:
@@ -47,4 +90,6 @@ jobs:
           SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
           SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
           ICU_TRACK_FROM: ${{ github.event.inputs.track_from || '2026-07-01' }}
+          ICU_SHARD_TOTAL: ${{ needs.prepare.outputs.total }}
+          ICU_SHARD_INDEX: ${{ matrix.shard }}
         run: python icu_billing_tracker.py
