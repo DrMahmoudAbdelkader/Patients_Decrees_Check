@@ -80,7 +80,8 @@ FIN_CATEGORY_ID = int(os.environ.get("BMT_FIN_CATEGORY_ID", "4"))              #
 FIRST_VALUE = float(os.environ.get("BMT_FIRST_DECREE_VALUE", "125000"))
 SECOND_VALUE = float(os.environ.get("BMT_SECOND_DECREE_VALUE", "100000"))
 BILL_DAYS_AFTER_DISCHARGE = int(os.environ.get("BMT_BILL_DAYS", "7"))           # working days, Fridays skipped
-DECREE_SLACK_DAYS = int(os.environ.get("BMT_DECREE_SLACK_DAYS", "0"))           # decree dated up to N days BEFORE check-in still accepted
+DECREE_SLACK_DAYS = int(os.environ.get("BMT_DECREE_SLACK_DAYS", "0"))           # SECOND (100,000) decree: dated up to N days BEFORE check-in still accepted
+FIRST_LOOKBACK_DAYS = int(os.environ.get("BMT_FIRST_LOOKBACK_DAYS", "270"))     # FIRST (125,000) decree is issued when the transplant is approved, i.e. MONTHS before check-in (observed Mar-Jun for Jul-Sep admissions)
 CONTEXT_DAYS = int(os.environ.get("BMT_CONTEXT_DAYS", "120"))                   # earlier BMT admissions still loaded (they bound the decree window)
 SEARCH_WINDOW_DAYS = int(os.environ.get("BMT_SEARCH_WINDOW_DAYS", "175"))      # SMC screen refuses > 6 months between dateFrom and dateTo
 SEARCH_MAX_PAGES = int(os.environ.get("BMT_SEARCH_MAX_PAGES", "12"))
@@ -169,7 +170,7 @@ def parse_decree_search(html: str) -> Tuple[List[dict], Optional[int]]:
 def search_windows(oldest_check_in: date, today: date) -> List[Tuple[date, date]]:
     """SMC's screen accepts at most 6 months between dateFrom and dateTo (observed: with a national id the server
     returned decrees outside the window anyway). Chain windows from the oldest check-in up to tomorrow."""
-    out, start = [], oldest_check_in - timedelta(days=7)
+    out, start = [], oldest_check_in - timedelta(days=max(7, FIRST_LOOKBACK_DAYS))
     while True:
         end = min(start + timedelta(days=SEARCH_WINDOW_DAYS), today + timedelta(days=1))
         out.append((start, end))
@@ -209,13 +210,24 @@ def fetch_decrees_by_nid(sess, nid: str, windows: List[Tuple[date, date]]) -> Op
 # =====================================================================
 # Matching a patient's decrees to his BMT admissions   (pure)
 # =====================================================================
-def _why_missing(role: str, adm: dict, decrees: List[dict], hi: Optional[date], used: set) -> str:
+def _lower_bound(role: str, adm: dict, prev_ci: Optional[date]) -> date:
+    """Earliest decree date accepted for this role. First decree: up to FIRST_LOOKBACK_DAYS before check-in, but never
+    earlier than the patient's previous BMT check-in (older decrees belong to that earlier admission)."""
+    ci = adm["check_in_date"]
+    if role == "first":
+        lo = ci - timedelta(days=FIRST_LOOKBACK_DAYS)
+        return max(lo, prev_ci) if prev_ci else lo
+    return ci - timedelta(days=DECREE_SLACK_DAYS)
+
+
+def _why_missing(role: str, adm: dict, decrees: List[dict], hi: Optional[date], used: set,
+                 prev_ci: Optional[date] = None) -> str:
     """One short sentence saying WHY no decree of this role was matched (written to the row's notes)."""
     v = ROLE_VALUE[role]
     same = [d for d in decrees if d.get("decree_value") is not None and abs(float(d["decree_value"]) - v) < 0.5]
     if not same:
         return f"no decree of value {v:,.0f} is listed for this patient on SMC"
-    lo = adm["check_in_date"] - timedelta(days=DECREE_SLACK_DAYS)
+    lo = _lower_bound(role, adm, prev_ci)
     parts = []
     for d in sorted(same, key=lambda x: (x.get("decree_date") or date.max, x["decree_number"])):
         dd = d.get("decree_date")
@@ -226,7 +238,7 @@ def _why_missing(role: str, adm: dict, decrees: List[dict], hi: Optional[date], 
         elif not dd:
             why = "no date"
         elif dd < lo:
-            why = f"dated {(adm['check_in_date'] - dd).days} day(s) BEFORE check-in"
+            why = f"dated {(adm['check_in_date'] - dd).days} day(s) BEFORE check-in (accepted from {lo})"
         elif hi and dd >= hi:
             why = "dated after the next BMT admission"
         else:
@@ -246,7 +258,7 @@ def match_bmt_decrees(admissions: List[dict], decrees: List[dict],
     cands = [d for d in decrees if d.get("decree_date") and is_state_fund_decree(d) and role_of_value(d.get("decree_value"))]
     out: Dict[int, dict] = {}
     for i, s in enumerate(adms):
-        lo = s["check_in_date"] - timedelta(days=DECREE_SLACK_DAYS)
+        prev_ci = adms[i - 1]["check_in_date"] if i > 0 else None
         hi = adms[i + 1]["check_in_date"] if i + 1 < len(adms) else None
         res = {"first": None, "second": None, "notes": []}
         for role in ROLES:
@@ -254,16 +266,17 @@ def match_bmt_decrees(admissions: List[dict], decrees: List[dict],
             if known:
                 res[role] = known
                 continue
+            lo = _lower_bound(role, s, prev_ci)
             pool = [d for d in cands if role_of_value(d["decree_value"]) == role and d["decree_number"] not in used
                     and d["decree_date"] >= lo and (hi is None or d["decree_date"] < hi)]
             pool.sort(key=lambda d: (d["decree_date"], d["decree_number"]))
             if not pool:
-                res["notes"].append(_why_missing(role, s, decrees, hi, used))
+                res["notes"].append(_why_missing(role, s, decrees, hi, used, prev_ci))
             if pool:
                 res[role] = pool[0]
                 used.add(pool[0]["decree_number"])
                 if len(pool) > 1:
-                    res["notes"].append(f"{len(pool)} decrees of value {ROLE_VALUE[role]:g} after check-in - the earliest "
+                    res["notes"].append(f"{len(pool)} decrees of value {ROLE_VALUE[role]:g} in the accepted window - the earliest "
                                         f"({pool[0]['decree_number']}) is used")
         f, sc = res["first"], res["second"]
         if f and sc and sc.get("decree_date") and f.get("decree_date") and sc["decree_date"] < f["decree_date"]:
@@ -665,9 +678,13 @@ def _selftest():
     st = {"admission_id": 1, "check_in_date": D(2026, 7, 1), "check_out_date": D(2026, 10, 5)}
     m = match_bmt_decrees([st], rows)[1]
     assert m["first"]["decree_number"] == "202640051000" and m["second"]["decree_number"] == "202641071969", m
-    #     decree dated before check-in is not taken (slack 0) ...
+    #     first decree may precede check-in by up to FIRST_LOOKBACK_DAYS, but not more ...
     late = dict(st, check_in_date=D(2026, 7, 10))
-    assert match_bmt_decrees([late], rows)[1]["first"] is None
+    assert match_bmt_decrees([late], rows)[1]["first"]["decree_number"] == "202640051000"
+    far = dict(st, check_in_date=D(2026, 7, 4) + timedelta(days=FIRST_LOOKBACK_DAYS + 5))
+    assert match_bmt_decrees([far], rows)[1]["first"] is None
+    #     ... while the second (100,000) decree still needs to be on/after check-in (slack 0)
+    assert match_bmt_decrees([dict(st, check_in_date=D(2026, 9, 10))], rows)[1]["second"] is None
     #     ... two admissions of one patient: each gets the decrees dated inside its own window
     a1 = {"admission_id": 1, "check_in_date": D(2026, 7, 1), "check_out_date": D(2026, 8, 1)}
     a2 = {"admission_id": 2, "check_in_date": D(2026, 9, 1), "check_out_date": D(2026, 10, 5)}
@@ -734,7 +751,7 @@ def _selftest():
     assert [m["month"] for m in rollforward([P(D(2026, 12, 20), None)], D(2027, 1, 5))] == ["2026-12", "2027-01"]
     # --- search windows chain without gaps
     w = search_windows(D(2026, 7, 1), D(2026, 12, 30))
-    assert w[0][0] == D(2026, 6, 24) and w[-1][1] == D(2026, 12, 31) and all(a[1] == b[0] for a, b in zip(w, w[1:]))
+    assert w[0][0] == D(2026, 7, 1) - timedelta(days=max(7, FIRST_LOOKBACK_DAYS)) and w[-1][1] == D(2026, 12, 31) and all(a[1] == b[0] for a, b in zip(w, w[1:]))
     return True
 
 
