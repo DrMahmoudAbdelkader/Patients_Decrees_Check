@@ -1,11 +1,13 @@
 # .github/workflows/icu-billing-tracker.yml
+# Jobs: prepare -> track (ICU, N shards) -> bmt (BMT state-fund billing, ONE runner, runs after the ICU shards
+# finish, whether or not they succeeded, so a failed ICU shard never blocks the BMT data).
 # Runs icu_billing_tracker.py twice a day so a 24h/48h deadline is never detected
 # more than ~half a day late. Cairo is UTC+2 (UTC+3 in summer): 05:00 and 13:00 UTC
 # land at roughly 07-08 and 15-16 Cairo time.
 #
 # The patients are split over N parallel runners (default 20). Runner i handles patient
 # number i, i+N, i+2N ... of the sorted national-id list, so all stays of a patient stay together.
-name: ICU billing tracker
+name: ICU + BMT billing tracker
 
 on:
   schedule:
@@ -13,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       track_from:
-        description: "Override ICU_TRACK_FROM (YYYY-MM-DD). Leave empty for 2026-07-01."
+        description: "Override ICU_TRACK_FROM / BMT_TRACK_FROM (YYYY-MM-DD). Leave empty for 2026-07-01."
         required: false
         default: ""
       shards:
@@ -45,7 +47,9 @@ jobs:
 
       # the logic test runs once here, not on every runner
       - name: Offline logic self-test
-        run: python icu_billing_tracker.py --selftest
+        run: |
+          python icu_billing_tracker.py --selftest
+          python bmt_billing_tracker.py --selftest
 
       - name: Build shard matrix
         id: m
@@ -93,3 +97,32 @@ jobs:
           ICU_SHARD_TOTAL: ${{ needs.prepare.outputs.total }}
           ICU_SHARD_INDEX: ${{ matrix.shard }}
         run: python icu_billing_tracker.py
+
+  # BMT: one runner is enough (a few dozen State-Fund discharges per month). It goes straight to the
+  # patient's issued decrees by national id -- no request is investigated.
+  bmt:
+    needs: [prepare, track]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    name: bmt (state-fund bundle billing)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 tzdata
+
+      - name: Run BMT tracker
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # decree portal (decree search, decree page, receipts)
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          BMT_TRACK_FROM: ${{ github.event.inputs.track_from || '2026-07-01' }}
+        run: python bmt_billing_tracker.py
