@@ -1,0 +1,48 @@
+# .github/workflows/bmt-billing-tracker.yml
+# BMT (bone marrow transplant) state-fund billing tracker.
+# Starts automatically right after the "ICU billing tracker" workflow finishes (same twice-a-day cadence,
+# whether the ICU run succeeded or not), and can be started by hand from the Actions tab.
+name: BMT billing tracker
+
+on:
+  workflow_run:
+    workflows: ["ICU billing tracker"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      track_from:
+        description: "Override BMT_TRACK_FROM (YYYY-MM-DD). Leave empty for 2026-07-01."
+        required: false
+        default: ""
+
+concurrency:
+  group: bmt-billing-tracker
+  cancel-in-progress: false
+
+jobs:
+  bmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    name: BMT tracker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 tzdata
+
+      - name: Offline logic self-test
+        run: python bmt_billing_tracker.py --selftest
+
+      - name: Run BMT tracker
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          BMT_TRACK_FROM: ${{ github.event.inputs.track_from || '2026-07-01' }}
+        run: python bmt_billing_tracker.py
