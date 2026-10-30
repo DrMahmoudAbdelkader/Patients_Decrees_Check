@@ -374,7 +374,8 @@ def load_bmt_stays() -> List[dict]:
     depts = sb.fetch_all("departments", "id,name_ar")
     bmt = next((d for d in depts if (d.get("name_ar") or "").strip() == BMT_DEPARTMENT_NAME), None)
     if not bmt:
-        raise RuntimeError(f"BMT department '{BMT_DEPARTMENT_NAME}' not found in departments.")
+        names = ", ".join(repr((d.get("name_ar") or "").strip()) for d in depts)
+        raise RuntimeError(f"BMT department '{BMT_DEPARTMENT_NAME}' not found in departments. Available name_ar values: {names}")
     rows = sb.fetch_all(
         "patient_admissions",
         "id,patient_id,check_in_date,check_out_date,departure_type,financial_category_id,patients(name,national_id)",
