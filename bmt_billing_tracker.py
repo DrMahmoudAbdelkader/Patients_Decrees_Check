@@ -209,6 +209,32 @@ def fetch_decrees_by_nid(sess, nid: str, windows: List[Tuple[date, date]]) -> Op
 # =====================================================================
 # Matching a patient's decrees to his BMT admissions   (pure)
 # =====================================================================
+def _why_missing(role: str, adm: dict, decrees: List[dict], hi: Optional[date], used: set) -> str:
+    """One short sentence saying WHY no decree of this role was matched (written to the row's notes)."""
+    v = ROLE_VALUE[role]
+    same = [d for d in decrees if d.get("decree_value") is not None and abs(float(d["decree_value"]) - v) < 0.5]
+    if not same:
+        return f"no decree of value {v:,.0f} is listed for this patient on SMC"
+    lo = adm["check_in_date"] - timedelta(days=DECREE_SLACK_DAYS)
+    parts = []
+    for d in sorted(same, key=lambda x: (x.get("decree_date") or date.max, x["decree_number"])):
+        dd = d.get("decree_date")
+        if d["decree_number"] in used:
+            why = "already used by another admission"
+        elif not is_state_fund_decree(d):
+            why = f"type is not state fund ({d.get('decree_type')})"
+        elif not dd:
+            why = "no date"
+        elif dd < lo:
+            why = f"dated {(adm['check_in_date'] - dd).days} day(s) BEFORE check-in"
+        elif hi and dd >= hi:
+            why = "dated after the next BMT admission"
+        else:
+            why = "not matched"
+        parts.append(f"{d['decree_number']} ({dd}) {why}")
+    return f"{v:,.0f} decree rejected: " + "; ".join(parts)
+
+
 def match_bmt_decrees(admissions: List[dict], decrees: List[dict],
                       pinned: Optional[Dict[int, Dict[str, dict]]] = None) -> Dict[int, dict]:
     """admissions: ALL BMT admissions of ONE patient. decrees: everything SMC lists for him.
@@ -231,6 +257,8 @@ def match_bmt_decrees(admissions: List[dict], decrees: List[dict],
             pool = [d for d in cands if role_of_value(d["decree_value"]) == role and d["decree_number"] not in used
                     and d["decree_date"] >= lo and (hi is None or d["decree_date"] < hi)]
             pool.sort(key=lambda d: (d["decree_date"], d["decree_number"]))
+            if not pool:
+                res["notes"].append(_why_missing(role, s, decrees, hi, used))
             if pool:
                 res[role] = pool[0]
                 used.add(pool[0]["decree_number"])
@@ -423,6 +451,14 @@ def run() -> int:
     no_cat = sum(1 for s in scope if s.get("financial_category_id") is None)
     log.info(f"{len(scope)} BMT admission(s) discharged since {TRACK_FROM}: {len(stays)} are financial category "
              f"{FIN_CATEGORY_ID} (tracked), {len(scope) - len(stays)} other ({no_cat} with no category set)")
+    by: Dict[str, Dict[str, int]] = {}
+    for s_ in scope:
+        c_ = s_.get("financial_category_id")
+        by.setdefault(month_of(s_["check_out_date"]), {}).setdefault("unset" if c_ is None else str(c_), 0)
+        by[month_of(s_["check_out_date"])]["unset" if c_ is None else str(c_)] += 1
+    for m_ in sorted(by):
+        log.info(f"   discharged {m_}: {sum(by[m_].values())} admission(s) by financial_category_id -> "
+                 + ", ".join(f"{k}: {v}" for k, v in sorted(by[m_].items())))
     if not stays:
         upsert_uniform(RUNS_TABLE, [{"started_at": started, "finished_at": now_iso(), "ok": True,
                                       "stays_total": 0, "stays_checked": 0, "notes": "no qualifying BMT admissions"}], "id")
@@ -488,6 +524,12 @@ def run() -> int:
                         errors[s["admission_id"]].append("decree search could not be read")
                 else:
                     matches = match_bmt_decrees(nid_adms[nid], found, pinned)
+                    if any(not (matches.get(s["admission_id"]) or {}).get(r) and not pinned[s["admission_id"]].get(r)
+                           for s in mine for r in ROLES):
+                        log.warning(f"   {_mask(nid)}: SMC lists {len(found)} decree(s) -> " + " | ".join(
+                            f"{d['decree_number']} {d.get('decree_date')} {d.get('decree_value'):g} [{d.get('decree_type')}]"
+                            if d.get("decree_value") is not None else f"{d['decree_number']} {d.get('decree_date')} ? [{d.get('decree_type')}]"
+                            for d in sorted(found, key=lambda x: (x.get('decree_date') or date.max)))[:900])
             for s in mine:
                 aid = s["admission_id"]
                 if errors[aid]:
