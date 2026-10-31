@@ -25,11 +25,10 @@ WHAT IT TRACKS
     POST /smc//HospDecreeReceipts/GetHospitalDecreeReceipts  -> bills (receipts) of a decree
 
 HOW A DECREE IS PICKED
-  * decree type = state fund ("نفقة دولة"), value exactly 125,000 or 100,000
-  * decree date on/after the admission's check-in (BMT_DECREE_SLACK_DAYS earlier is tolerated)
-    and before the patient's NEXT BMT admission, if any
-  * the earliest unused decree of each value wins; the procedure text ("قرار اول"/"قرار ثاني",
-    "نخاع") is only a second check -> a disagreement is written as a note, never silently ignored.
+  * decree type = state fund ("نفقة دولة") whose procedure text mentions bone marrow ("نخاع"); the text also says which
+    one it is: "قرار اول" -> first, "قرار ثاني" -> second. NO date window and NO value rule: the decree may have been
+    issued any time (even before check-in) and have any value (only side decrees below BMT_FALLBACK_MIN_VALUE are
+    not read). With several candidates (readmission) each admission takes the decree dated nearest to its check-in.
 
 WHEN IS A DECREE "CONSUMED" / THE PATIENT "BILLED"
   * counted receipts (status code NOT starting with R) of the decree reach its value.
@@ -98,15 +97,15 @@ FIN_CATEGORY_ID = int(os.environ.get("BMT_FIN_CATEGORY_ID", "4"))              #
 FIRST_VALUE = float(os.environ.get("BMT_FIRST_DECREE_VALUE", "125000"))
 SECOND_VALUE = float(os.environ.get("BMT_SECOND_DECREE_VALUE", "100000"))
 BILL_DAYS_AFTER_DISCHARGE = int(os.environ.get("BMT_BILL_DAYS", "7"))           # working days, Fridays skipped
-DECREE_SLACK_DAYS = int(os.environ.get("BMT_DECREE_SLACK_DAYS", "0"))           # SECOND (100,000) decree: dated up to N days BEFORE check-in still accepted
 FIRST_LOOKBACK_DAYS = int(os.environ.get("BMT_FIRST_LOOKBACK_DAYS", "270"))     # FIRST (125,000) decree is issued when the transplant is approved, i.e. MONTHS before check-in (observed Mar-Jun for Jul-Sep admissions)
 CONTEXT_DAYS = int(os.environ.get("BMT_CONTEXT_DAYS", "120"))                   # earlier BMT admissions still loaded (they bound the decree window)
 SEARCH_WINDOW_DAYS = int(os.environ.get("BMT_SEARCH_WINDOW_DAYS", "175"))      # SMC screen refuses > 6 months between dateFrom and dateTo
 SEARCH_MAX_PAGES = int(os.environ.get("BMT_SEARCH_MAX_PAGES", "12"))
 DECREE_SOURCE = os.environ.get("BMT_DECREE_SOURCE", "1")                        # decreeSource value the SMC decree screen sends
 STANDARD_BUNDLE = float(os.environ.get("BMT_STANDARD_BUNDLE", "225000"))        # accrual per patient; a patient with both decrees issued but a lower total is an exception
+ACCRUE_EXCEPTIONS = os.environ.get("BMT_ACCRUE_EXCEPTIONS", "1") != "0"         # 1 = a patient is accrued at his ACTUAL decree total (exceptions included); 0 = exceptions accrue nothing
 FALLBACK_MIN_VALUE = float(os.environ.get("BMT_FALLBACK_MIN_VALUE", "20000"))   # decrees below this are never taken by description (1,000 / 5,000 side decrees)
-FALLBACK_MAX_PAGES = int(os.environ.get("BMT_FALLBACK_MAX_PAGES", "8"))         # decree pages read per patient while looking for the description match
+FALLBACK_MAX_PAGES = int(os.environ.get("BMT_FALLBACK_MAX_PAGES", "12"))         # decree pages read per patient while looking for the description match
 DESC_KEYWORD = os.environ.get("BMT_DESC_KEYWORD", "نخاع")                        # words that mark a bone-marrow decree ("زرع نخاع")
 REQUEST_DELAY = icu.REQUEST_DELAY
 
@@ -134,9 +133,9 @@ def role_of_value(value: Optional[float]) -> Optional[str]:
 def text_role(procedure_text: Optional[str]) -> Optional[str]:
     """'... لزرع نخاع ذاتي (قرار ثاني)' -> 'second', '(قرار اول)' -> 'first', else None."""
     n = norm_ar(procedure_text)
-    if "ثاني" in n:
+    if re.search(r"ثان[يى]", n):
         return "second"
-    if re.search(r"قرار\s*(ال)?اول", n):
+    if re.search(r"(?<![\u0621-\u064A])(ال)?اول(?![\u0621-\u064A])", n):
         return "first"
     return None
 
@@ -232,144 +231,93 @@ def fetch_decrees_by_nid(sess, nid: str, windows: List[Tuple[date, date]]) -> Op
 # =====================================================================
 # Matching a patient's decrees to his BMT admissions   (pure)
 # =====================================================================
-def _lower_bound(role: str, adm: dict, prev_ci: Optional[date]) -> date:
-    """Earliest decree date accepted for this role. First decree: up to FIRST_LOOKBACK_DAYS before check-in, but never
-    earlier than the patient's previous BMT check-in (older decrees belong to that earlier admission)."""
-    ci = adm["check_in_date"]
-    if role == "first":
-        lo = ci - timedelta(days=FIRST_LOOKBACK_DAYS)
-        return max(lo, prev_ci) if prev_ci else lo
-    return ci - timedelta(days=DECREE_SLACK_DAYS)
-
-
-def _why_missing(role: str, adm: dict, decrees: List[dict], hi: Optional[date], used: set,
-                 prev_ci: Optional[date] = None) -> str:
-    """One short sentence saying WHY no decree of this role was matched (written to the row's notes)."""
-    v = ROLE_VALUE[role]
-    same = [d for d in decrees if d.get("decree_value") is not None and abs(float(d["decree_value"]) - v) < 0.5]
-    if not same:
-        return f"no decree of value {v:,.0f} is listed for this patient on SMC"
-    lo = _lower_bound(role, adm, prev_ci)
-    parts = []
-    for d in sorted(same, key=lambda x: (x.get("decree_date") or date.max, x["decree_number"])):
-        dd = d.get("decree_date")
-        if d["decree_number"] in used:
-            why = "already used by another admission"
-        elif not is_state_fund_decree(d):
-            why = f"type is not state fund ({d.get('decree_type')})"
-        elif not dd:
-            why = "no date"
-        elif dd < lo:
-            why = f"dated {(adm['check_in_date'] - dd).days} day(s) BEFORE check-in (accepted from {lo})"
-        elif hi and dd >= hi:
-            why = "dated after the next BMT admission"
-        else:
-            why = "not matched"
-        parts.append(f"{d['decree_number']} ({dd}) {why}")
-    return f"{v:,.0f} decree rejected: " + "; ".join(parts)
-
-
 def has_bone_marrow_text(d: dict) -> bool:
     return DESC_KEYWORD in norm_ar(d.get("procedure_text") or "")
 
 
-def fallback_candidates(adm: dict, prev_ci: Optional[date], hi: Optional[date], decrees: List[dict], used: set,
-                        require_text: bool) -> List[dict]:
-    """State-fund decrees of NON-regular value (>= FALLBACK_MIN_VALUE) inside the admission's decree window.
-    require_text=True keeps only those whose procedure text mentions bone marrow (the actual match);
-    require_text=False is the list of decree pages the caller still has to read."""
-    lo = _lower_bound("first", adm, prev_ci)            # the variable decree is issued like the first one: possibly months before check-in
+def bmt_candidates(decrees: List[dict], used: set, need_text: bool) -> List[dict]:
+    """State-fund decrees of the patient that may be a BMT decree. NO date window and NO value rule: a BMT decree is
+    recognised only by its description. FALLBACK_MIN_VALUE only keeps the small side decrees (1,000 / 5,000 ...) out so
+    that their pages are not read. need_text=True -> only decrees whose page text mentions bone marrow ("نخاع")."""
     out = []
     for d in decrees:
-        v, dd = d.get("decree_value"), d.get("decree_date")
-        if v is None or dd is None or role_of_value(v) or float(v) < FALLBACK_MIN_VALUE:
+        v = d.get("decree_value")
+        if v is None or not d.get("decree_date") or float(v) < FALLBACK_MIN_VALUE or not is_state_fund_decree(d) or d["decree_number"] in used:
             continue
-        if d["decree_number"] in used or not is_state_fund_decree(d) or dd < lo or (hi is not None and dd >= hi):
-            continue
-        if require_text and not has_bone_marrow_text(d):
+        if need_text and not has_bone_marrow_text(d):
             continue
         out.append(d)
-    out.sort(key=lambda d: (d["decree_date"], d["decree_number"]))
     return out
 
 
 def match_bmt_decrees(admissions: List[dict], decrees: List[dict],
                       pinned: Optional[Dict[int, Dict[str, dict]]] = None,
-                      use_description: bool = False) -> Dict[int, dict]:
-    """admissions: ALL BMT admissions of ONE patient. decrees: everything SMC lists for him.
+                      use_description: bool = True) -> Dict[int, dict]:
+    """admissions: ALL BMT admissions of ONE patient. decrees: everything SMC lists for him (procedure_text read).
     pinned: {admission_id: {role: decree dict}} already known from earlier runs (never re-matched).
-    use_description: also accept a decree of any value (>= FALLBACK_MIN_VALUE) whose procedure_text mentions bone
-    marrow for a role that its regular value (125,000 / 100,000) could not fill.
-    -> {admission_id: {"first": dec|None, "second": dec|None, "notes": [..]}}  (new matches carry "source")"""
+    A decree is a BMT decree when it is state fund and its description mentions bone marrow ("زرع نخاع"); the description
+    also says which one it is: "قرار اول" -> first, "قرار ثاني" -> second. Dates and values do not matter. When several
+    decrees carry the same role (readmission / second transplant) each admission takes the one dated nearest to its
+    check-in. A bone-marrow decree without any first/second wording fills the role still free (100,000 -> second, else first).
+    -> {admission_id: {"first": dec|None, "second": dec|None, "notes": [..]}}  (new matches carry source='description')"""
     pinned = pinned or {}
     adms = sorted(admissions, key=lambda s: (s["check_in_date"], s["check_out_date"] or date.max, s["admission_id"]))
     used = {d["decree_number"] for per in pinned.values() for d in per.values() if d}
-    cands = [d for d in decrees if d.get("decree_date") and is_state_fund_decree(d) and role_of_value(d.get("decree_value"))]
     out: Dict[int, dict] = {}
-    for i, s in enumerate(adms):
-        prev_ci = adms[i - 1]["check_in_date"] if i > 0 else None
-        hi = adms[i + 1]["check_in_date"] if i + 1 < len(adms) else None
+    for s in adms:
         res = {"first": None, "second": None, "notes": []}
         for role in ROLES:
             known = (pinned.get(s["admission_id"]) or {}).get(role)
             if known:
                 res[role] = known
                 continue
-            lo = _lower_bound(role, s, prev_ci)
-            pool = [d for d in cands if role_of_value(d["decree_value"]) == role and d["decree_number"] not in used
-                    and d["decree_date"] >= lo and (hi is None or d["decree_date"] < hi)]
-            pool.sort(key=lambda d: (d["decree_date"], d["decree_number"]))
+            pool = [d for d in bmt_candidates(decrees, used, True) if text_role(d.get("procedure_text")) == role]
             if not pool:
-                res["notes"].append(_why_missing(role, s, decrees, hi, used, prev_ci))
-            if pool:
-                res[role] = dict(pool[0], source="value")
-                used.add(pool[0]["decree_number"])
-                if len(pool) > 1:
-                    res["notes"].append(f"{len(pool)} decrees of value {ROLE_VALUE[role]:g} in the accepted window - the earliest "
-                                        f"({pool[0]['decree_number']}) is used")
-        if use_description:
-            missing = [r for r in ROLES if not res[r]]
-            if missing:
-                pool = fallback_candidates(s, prev_ci, hi, decrees, used, require_text=True)
-                for role in missing:
-                    if not pool:
-                        break
-                    # the decree page itself says which one it is ("قرار اول"/"قرار ثاني"); otherwise first come first served
-                    pick = next((d for d in pool if text_role(d.get("procedure_text")) == role), None) or pool[0]
-                    pool.remove(pick)
-                    used.add(pick["decree_number"])
-                    res[role] = dict(pick, source="description")
-                    res["notes"].append(f"{role} decree {pick['decree_number']} (value {float(pick['decree_value']):g}) matched by "
-                                        f"its description (bone marrow), not by a regular value")
-                    res["notes"] = [n for n in res["notes"] if not (n.startswith(f"{ROLE_VALUE[role]:,.0f} decree rejected")
-                                                                    or n.startswith(f"no decree of value {ROLE_VALUE[role]:,.0f}"))]
+                continue
+            pool.sort(key=lambda d: (abs((d["decree_date"] - s["check_in_date"]).days), d["decree_date"], d["decree_number"]))
+            res[role] = dict(pool[0], source="description")
+            used.add(pool[0]["decree_number"])
+            if len(pool) > 1:
+                res["notes"].append(f"{len(pool)} bone-marrow decrees worded as '{'قرار اول' if role == 'first' else 'قرار ثاني'}' - the one dated "
+                                    f"nearest to check-in ({pool[0]['decree_number']}) is used")
+        out[s["admission_id"]] = res
+    for s in adms:                                           # second pass: bone-marrow decrees without first/second wording
+        res = out[s["admission_id"]]
+        for role in [r for r in ROLES if not res[r]]:
+            pool = [d for d in bmt_candidates(decrees, used, True) if text_role(d.get("procedure_text")) is None
+                    and (role_of_value(d["decree_value"]) in (None, role))]
+            if not pool:
+                continue
+            pool.sort(key=lambda d: (abs((d["decree_date"] - s["check_in_date"]).days), d["decree_date"], d["decree_number"]))
+            res[role] = dict(pool[0], source="description")
+            used.add(pool[0]["decree_number"])
+            res["notes"].append(f"{role} decree {pool[0]['decree_number']} has no first/second wording - role taken from its value")
+    for s in adms:
+        res = out[s["admission_id"]]
+        for role in ROLES:
+            if not res[role]:
+                n_read = sum(1 for d in decrees if d.get("procedure_text") is not None and d.get("decree_value") is not None
+                             and float(d["decree_value"]) >= FALLBACK_MIN_VALUE and is_state_fund_decree(d))
+                res["notes"].append(f"no state-fund decree of this patient says bone marrow + '{'قرار اول' if role == 'first' else 'قرار ثاني'}' "
+                                    f"({n_read} state-fund decree(s) of value >= {FALLBACK_MIN_VALUE:,.0f} read)")
         f, sc = res["first"], res["second"]
         if f and sc and sc.get("decree_date") and f.get("decree_date") and sc["decree_date"] < f["decree_date"]:
-            res["notes"].append("the 100,000 decree is dated before the 125,000 decree")
-        out[s["admission_id"]] = res
+            res["notes"].append("the 'second' decree is dated before the 'first' decree")
     return out
 
 
 def decrees_to_read(admissions: List[dict], decrees: List[dict], matches: Dict[int, dict],
                     pinned: Optional[Dict[int, Dict[str, dict]]] = None) -> List[dict]:
-    """After a first matching pass: the fallback decrees whose pages must be read (procedure text unknown yet) because
-    some admission still lacks a decree. Capped at FALLBACK_MAX_PAGES."""
+    """The decree pages that still have to be read (procedure text unknown) because some admission lacks a decree.
+    Every state-fund decree >= FALLBACK_MIN_VALUE is read, whatever its date; capped at FALLBACK_MAX_PAGES (oldest first)."""
     pinned = pinned or {}
-    adms = sorted(admissions, key=lambda s: (s["check_in_date"], s["check_out_date"] or date.max, s["admission_id"]))
     used = {d["decree_number"] for per in pinned.values() for d in per.values() if d}
     for m in matches.values():
         used |= {m[r]["decree_number"] for r in ROLES if m.get(r)}
-    todo: Dict[str, dict] = {}
-    for i, s in enumerate(adms):
-        m = matches.get(s["admission_id"]) or {}
-        if m.get("first") and m.get("second"):
-            continue
-        prev_ci = adms[i - 1]["check_in_date"] if i > 0 else None
-        hi = adms[i + 1]["check_in_date"] if i + 1 < len(adms) else None
-        for d in fallback_candidates(s, prev_ci, hi, decrees, used, require_text=False):
-            if d.get("procedure_text") is None:
-                todo.setdefault(d["decree_number"], d)
-    return sorted(todo.values(), key=lambda d: (d["decree_date"], d["decree_number"]))[:FALLBACK_MAX_PAGES]
+    if all((matches.get(s["admission_id"]) or {}).get("first") and (matches.get(s["admission_id"]) or {}).get("second") for s in admissions):
+        return []
+    todo = [d for d in bmt_candidates(decrees, used, False) if d.get("procedure_text") is None]
+    return sorted(todo, key=lambda d: (d["decree_date"], d["decree_number"]))[:FALLBACK_MAX_PAGES]
 
 
 # =====================================================================
@@ -475,7 +423,7 @@ def evaluate_bmt(stay: dict, decs: Dict[str, Optional[dict]], receipts: Dict[str
         "bundle_value": round(bundle, 2), "billed_value": round(billed_sum, 2),
         "remaining_value": round(max(0.0, bundle - billed_sum), 2),
         "decrees_count": present_n, "decrees_total": round(present_total, 2) if present_n else None,
-        "is_exception": is_exception, "accrual_value": 0.0 if is_exception else STANDARD_BUNDLE,
+        "is_exception": is_exception, "accrual_value": 0.0 if (is_exception and not ACCRUE_EXCEPTIONS) else round(bundle, 2),
         "last_decree_date": last_decree, "ready_date": ready,
         "decree_wait_days": (ready - co).days if ready else None,
         "billing_work_days": (billed_on - ready).days if (billed_on and ready) else None,
@@ -555,54 +503,129 @@ def rollforward(rows: List[dict], today: date) -> List[dict]:
     return out
 
 
+def _month_end(m: str) -> date:
+    y, mo = int(m[:4]), int(m[5:])
+    return (date(y + (mo == 12), (mo % 12) + 1, 1) - timedelta(days=1))
+
+
+def _slots(r: dict) -> List[dict]:
+    """The decrees an admission accrues: every ISSUED decree at its real value + a nominal slot for each decree not issued yet
+    (125,000 for a missing first, 100,000 for a missing second). Sum of the slots = the patient's accrual."""
+    if "dec1_number" not in r and "dec2_number" not in r:             # legacy row: a single lump accrual
+        v = float(r.get("accrual_value") or 0)
+        return [{"key": None, "value": v, "issued_on": None, "issued": True}] if v > EPS else []
+    out = []
+    for role in ROLES:
+        p = ROLE_COL[role]
+        if r.get(f"{p}_number") and r.get(f"{p}_value") is not None:
+            out.append({"key": str(r[f"{p}_number"]), "value": float(r[f"{p}_value"]),
+                        "issued_on": to_date(r.get(f"{p}_date")) if r.get(f"{p}_date") else None, "issued": True})
+        else:
+            out.append({"key": None, "value": ROLE_VALUE[role], "issued_on": None, "issued": False})
+    if r.get("is_exception") and not ACCRUE_EXCEPTIONS:
+        return []
+    return out
+
+
 def value_ledger(rows: List[dict], receipts: List[dict], today: date) -> List[dict]:
-    """MONEY-based accrual. rows: {admission_id, check_out_date, accrual_value, closed_on|None}  (exceptions have accrual 0).
-    receipts: {admission_id, registered_on, value, counted}.
-    Every patient accrues accrual_value (225,000) in his discharge month. Counted receipts reduce it, in the month they were
-    registered (a receipt dated before the discharge counts in the discharge month; capped so a patient never bills more than
-    his accrual). A manually closed patient bills the remainder on closed_on.
-    Per month: opening + new - billed = closing, and billed is split by the month the patient was discharged in."""
-    rows = [r for r in rows if float(r.get("accrual_value") or 0) > EPS]
-    if not rows:
+    """MONEY-based accrual on the patient's REAL decree total.
+    rows: tracking rows {admission_id, check_out_date, dec1_/dec2_ number/value/date, closed_on|None}.
+    receipts: {admission_id, decree_number, registered_on, value, counted}.
+    A patient accrues (in his discharge month) the value of his issued decrees + the nominal value of a decree still to be
+    issued. Counted receipts reduce the balance of THEIR decree (capped at that decree's value) in the month they were
+    registered (a receipt dated before discharge counts in the discharge month). A manually/script closed patient bills the
+    remaining balance on closed_on.
+    Per month: opening + new - billed = closing; closing is split by origin month and into balance on ISSUED decrees vs
+    balance on decrees NOT YET ISSUED (nominal); counts: patients with a balance, patients whose balance reached 0."""
+    prepared = []
+    for r in rows:
+        sl = _slots(r)
+        if sl:
+            prepared.append((r, sl))
+    if not prepared:
         return []
     by_adm: Dict[int, List[dict]] = {}
     for rc in receipts:
         if rc.get("counted", True) and rc.get("value"):
             by_adm.setdefault(rc["admission_id"], []).append(rc)
-    events: List[Tuple[str, str, float]] = []          # (billed month, origin month, amount)
-    for r in rows:
-        left = float(r["accrual_value"])
+    ev: List[dict] = []                      # {adm, month, origin, amt, slot}
+    for r, sl in prepared:
+        left = [x["value"] for x in sl]
         origin = month_of(r["check_out_date"])
         for rc in sorted(by_adm.get(r["admission_id"], []), key=lambda x: (x.get("registered_on") or today, str(x.get("receipt_id")))):
-            amt = min(float(rc["value"]), left)
+            i = next((k for k, x in enumerate(sl) if x["key"] and x["key"] == str(rc.get("decree_number") or "")), None)
+            if i is None:                                                 # decree unknown (legacy rows): first issued slot with a balance
+                i = next((k for k, x in enumerate(sl) if x["issued"] and left[k] > EPS), None)
+            if i is None:
+                continue
+            amt = min(float(rc["value"]), left[i])
             if amt <= EPS:
                 continue
-            left -= amt
-            events.append((month_of(max(rc.get("registered_on") or today, r["check_out_date"])), origin, amt))
-        if left > EPS and r.get("closed_on"):
-            events.append((month_of(max(r["closed_on"], r["check_out_date"])), origin, left))
-    months, m = [], month_of(min(r["check_out_date"] for r in rows))
+            left[i] -= amt
+            ev.append({"adm": r["admission_id"], "month": month_of(max(rc.get("registered_on") or today, r["check_out_date"])),
+                       "origin": origin, "amt": amt, "slot": i})
+        if r.get("closed_on"):
+            for i, x in enumerate(left):
+                if x > EPS:
+                    ev.append({"adm": r["admission_id"], "month": month_of(max(r["closed_on"], r["check_out_date"])),
+                               "origin": origin, "amt": x, "slot": i})
+    months, m = [], month_of(min(r["check_out_date"] for r, _ in prepared))
     cur = month_of(today)
     while m <= cur:
         months.append(m)
         y, mo = int(m[:4]), int(m[5:])
         m = f"{y + (mo == 12)}-{(mo % 12) + 1:02d}"
-    out = []
+
+    def balance(r, sl, upto: str):
+        """(issued balance, pending balance) of one admission at the end of month `upto`."""
+        end = _month_end(upto)
+        iss = pen = 0.0
+        for i, x in enumerate(sl):
+            b = x["value"] - sum(e["amt"] for e in ev if e["adm"] == r["admission_id"] and e["slot"] == i and e["month"] <= upto)
+            if b <= EPS:
+                continue
+            if x["issued"] and (x["issued_on"] is None or x["issued_on"] <= end):
+                iss += b
+            else:
+                pen += b
+        return iss, pen
+
+    out, prev_open = [], set()
     for m in months:
-        opening = sum(float(r["accrual_value"]) for r in rows if month_of(r["check_out_date"]) < m) - sum(a for bm, _, a in events if bm < m)
-        new_rows = [r for r in rows if month_of(r["check_out_date"]) == m]
-        new = sum(float(r["accrual_value"]) for r in new_rows)
-        billed_ev = [(o, a) for bm, o, a in events if bm == m]
+        new_rows = [(r, sl) for r, sl in prepared if month_of(r["check_out_date"]) == m]
+        new = sum(x["value"] for _, sl in new_rows for x in sl)
+        opening = sum(x["value"] for r, sl in prepared if month_of(r["check_out_date"]) < m for x in sl) \
+            - sum(e["amt"] for e in ev if e["month"] < m)
+        billed_ev = [e for e in ev if e["month"] == m]
         by_origin: Dict[str, float] = {}
-        for o, a in billed_ev:
-            by_origin[o] = round(by_origin.get(o, 0.0) + a, 2)
-        billed = sum(a for _, a in billed_ev)
+        for e in billed_ev:
+            by_origin[e["origin"]] = round(by_origin.get(e["origin"], 0.0) + e["amt"], 2)
+        billed = sum(e["amt"] for e in billed_ev)
+        iss_t = pen_t = 0.0
+        open_now, open_by_origin = set(), {}
+        for r, sl in prepared:
+            if month_of(r["check_out_date"]) > m:
+                continue
+            i_, p_ = balance(r, sl, m)
+            if i_ + p_ > EPS:
+                open_now.add(r["admission_id"])
+                o = month_of(r["check_out_date"])
+                n_, v_ = open_by_origin.get(o, (0, 0.0))
+                open_by_origin[o] = (n_ + 1, round(v_ + i_ + p_, 2))
+            iss_t += i_
+            pen_t += p_
+        new_ids = {r["admission_id"] for r, _ in new_rows}
+        closed_now = (prev_open | new_ids) - open_now
         out.append({"month": m, "opening_value": round(opening, 2), "new_n": len(new_rows), "new_value": round(new, 2),
                     "billed_value": round(billed, 2),
                     "billed_from_this_month": by_origin.get(m, 0.0),
                     "billed_from_previous_months": round(billed - by_origin.get(m, 0.0), 2),
                     "billed_by_origin": dict(sorted(by_origin.items())),
-                    "closing_value": round(opening + new - billed, 2)})
+                    "closing_value": round(opening + new - billed, 2),
+                    "closing_n": len(open_now), "closed_n": len(closed_now),
+                    "closing_issued": round(iss_t, 2), "closing_pending": round(pen_t, 2),
+                    "closing_by_origin": dict(sorted(open_by_origin.items()))})
+        prev_open = open_now
     return out
 
 
@@ -925,26 +948,26 @@ def report_run(stays, merged, errors, today, login_failed) -> int:
         t = dict(t)
         t["is_exception"] = bool(t.get("is_exception"))
         if t.get("accrual_value") is None:                      # rows written before the v2 columns existed
-            t["accrual_value"] = 0.0 if t["is_exception"] else STANDARD_BUNDLE
+            t["accrual_value"] = float(t.get("bundle_value") or STANDARD_BUNDLE)
         if t.get("_manual") == "closed" and not t.get("billed_on"):
             t["billed_on"] = to_date(str(t.get("manual_at") or "")[:10]) or today
         live_rows.append(t)
     exc = [t for t in live_rows if t["is_exception"]]
     if exc:
-        log.info(f"EXCEPTIONS (both decrees issued, total below {STANDARD_BUNDLE:,.0f}; tracked but not accrued): " + ", ".join(
+        log.info(f"EXCEPTIONS (both decrees issued, total below {STANDARD_BUNDLE:,.0f}; tracked; accrued at their real total unless BMT_ACCRUE_EXCEPTIONS=0): " + ", ".join(
             f"#{t['admission_id']} {_mask(str(t.get('patient_nid') or ''))} total {float(t.get('decrees_total') or 0):,.0f}" for t in exc))
     one = [t for t in live_rows if t.get("decrees_count") == 1]
     if one:
         log.info(f"{len(one)} admission(s) have ONE decree only - the second is still to be issued")
     log.info("-" * 78)
-    log.info("MONTHLY ACCRUAL ROLL-FORWARD  (patients: n / EGP)")
+    log.info("PATIENT-COUNT VIEW  (patients counted only when BOTH decrees are fully billed; the money ledger below is the accrual)")
     for m in rollforward(live_rows, today):
         log.info(f"{m['month']} | carried in {m['opening_n']}/{m['opening_value']:,.0f} + discharged {m['new_n']}/{m['new_value']:,.0f} "
                  f"- billed {m['billed_n']}/{m['billed_value']:,.0f} = carried out {m['closing_n']}/{m['closing_value']:,.0f}")
         for o, (n, v) in m["billed_by_origin"].items():
             log.info(f"        billed in {m['month']} from {'discharges of this month' if o == m['month'] else 'accrual of ' + o}: {n} / {v:,.0f}")
     try:
-        rc_rows = fetch_in(RECEIPTS_TABLE, "admission_id,receipt_id,registered_on,value,counted", "admission_id",
+        rc_rows = fetch_in(RECEIPTS_TABLE, "admission_id,receipt_id,decree_number,registered_on,value,counted", "admission_id",
                            [str(t["admission_id"]) for t in live_rows])
         for r in rc_rows:
             r["registered_on"] = to_date(r.get("registered_on"))
@@ -953,11 +976,14 @@ def report_run(stays, merged, errors, today, login_failed) -> int:
                                                   else (t.get("billed_on") if t.get("status") == "closed" else None)))
                                for t in live_rows], rc_rows, today)
         log.info("-" * 78)
-        log.info("MONEY ACCRUAL LEDGER  (EGP: receipts registered in the month reduce the 225,000 accrued at discharge)")
+        log.info("MONEY ACCRUAL LEDGER  (EGP: each patient accrues his REAL decree total (issued decrees + nominal value of a decree not issued yet); receipts reduce it)")
         for m in ledger:
             log.info(f"{m['month']} | carried in {m['opening_value']:,.0f} + discharged {m['new_n']} pts/{m['new_value']:,.0f} - billed "
                      f"{m['billed_value']:,.0f} (this month's patients {m['billed_from_this_month']:,.0f}, earlier months "
                      f"{m['billed_from_previous_months']:,.0f}) = unbilled accrual {m['closing_value']:,.0f}")
+            log.info(f"        patients with a balance {m['closing_n']} | closed this month {m['closed_n']} | balance on ISSUED decrees "
+                     f"{m['closing_issued']:,.0f} + on decrees NOT YET ISSUED {m['closing_pending']:,.0f}")
+            log.info("        balance by discharge month: " + " | ".join(f"{o}: {n} pts / {v:,.0f}" for o, (n, v) in m["closing_by_origin"].items()))
         if ledger:
             log.info(f"TOTAL UNBILLED ACCRUAL since {TRACK_FROM}: {ledger[-1]['closing_value']:,.0f}")
     except Exception as e:
@@ -1002,27 +1028,45 @@ def _selftest():
     assert role_of_value(125000) == "first" and role_of_value(100000.0) == "second" and role_of_value(5000) is None
     assert text_role("لزرع نخاع ذاتي (قرار ثاني)") == "second" and text_role("لزرع نخاع ذاتي (قرار اول)") == "first"
     assert text_role("لزرع نخاع ذاتي (قرار أول)") == "first" and text_role("شئ آخر") is None
-    # --- matching: only the 125k + 100k decrees of this admission; 5000 / 1000 decrees are ignored
+    # --- matching by DESCRIPTION only (no date window, no value rule)
     st = {"admission_id": 1, "check_in_date": D(2026, 7, 1), "check_out_date": D(2026, 10, 5)}
-    m = match_bmt_decrees([st], rows)[1]
-    assert m["first"]["decree_number"] == "202640051000" and m["second"]["decree_number"] == "202641071969", m
-    #     first decree may precede check-in by up to FIRST_LOOKBACK_DAYS, but not more ...
-    late = dict(st, check_in_date=D(2026, 7, 10))
-    assert match_bmt_decrees([late], rows)[1]["first"]["decree_number"] == "202640051000"
-    far = dict(st, check_in_date=D(2026, 7, 4) + timedelta(days=FIRST_LOOKBACK_DAYS + 5))
-    assert match_bmt_decrees([far], rows)[1]["first"] is None
-    #     ... while the second (100,000) decree still needs to be on/after check-in (slack 0)
-    assert match_bmt_decrees([dict(st, check_in_date=D(2026, 9, 10))], rows)[1]["second"] is None
-    #     ... two admissions of one patient: each gets the decrees dated inside its own window
+    T1, T2 = "لزرع نخاع ذاتي (قرار اول)", "لزرع نخاع ذاتي (قرار ثاني)"
+    mk = lambda n, dt, v, txt=None, typ="نفقة دولة": {"decree_number": n, "decree_date": dt, "decree_type": typ, "decree_value": v, "procedure_text": txt}
+    pat = [mk("F", D(2026, 4, 21), 125000.0, T1), mk("S", D(2026, 5, 31), 100000.0, T2),            # second decree issued BEFORE check-in (real case)
+           mk("N1", D(2026, 6, 6), 1000.0, "رعاية مركزة"), mk("N2", D(2026, 8, 23), 10000.0, "رعاية مركزة")]
+    m = match_bmt_decrees([dict(st, check_in_date=D(2026, 8, 1))], pat)[1]
+    assert m["first"]["decree_number"] == "F" and m["second"]["decree_number"] == "S" and m["first"]["source"] == "description", m
+    assert not m["notes"], m["notes"]
+    #     any date, any value: a decree issued years earlier / a 70,000 first decree are taken as long as the text says so
+    odd = [mk("OLD", D(2024, 1, 5), 70000.0, T1), mk("LATE", D(2027, 3, 1), 100000.0, T2)]
+    mo = match_bmt_decrees([st], odd)[1]
+    assert mo["first"]["decree_number"] == "OLD" and mo["second"]["decree_number"] == "LATE", mo
+    #     text decides, not the value: a 125,000 decree worded "ثاني" is the second
+    sw = match_bmt_decrees([st], [mk("A", D(2026, 5, 1), 125000.0, T2), mk("B", D(2026, 5, 2), 100000.0, T1)])[1]
+    assert sw["second"]["decree_number"] == "A" and sw["first"]["decree_number"] == "B", sw
+    #     no bone-marrow text -> never taken (even with the regular value); not state fund -> never taken; small side decrees ignored
+    assert match_bmt_decrees([st], [mk("X", D(2026, 5, 1), 125000.0, "علاج كيماوي")])[1]["first"] is None
+    assert match_bmt_decrees([st], [mk("X", D(2026, 5, 1), 125000.0, T1, "تأمين صحي")])[1]["first"] is None
+    assert match_bmt_decrees([st], [mk("X", D(2026, 5, 1), 5000.0, T1)])[1]["first"] is None
+    #     missing role -> note says why
+    only1 = match_bmt_decrees([st], [mk("F", D(2026, 4, 21), 125000.0, T1)])[1]
+    assert only1["second"] is None and any("قرار ثاني" in n for n in only1["notes"]), only1
+    #     bone-marrow decree without first/second wording: role from its value
+    nw = match_bmt_decrees([st], [mk("W", D(2026, 5, 1), 100000.0, "زرع نخاع")])[1]
+    assert nw["second"]["decree_number"] == "W" and nw["first"] is None
+    #     two admissions of one patient: each takes the decree nearest to its own check-in
     a1 = {"admission_id": 1, "check_in_date": D(2026, 7, 1), "check_out_date": D(2026, 8, 1)}
-    a2 = {"admission_id": 2, "check_in_date": D(2026, 9, 1), "check_out_date": D(2026, 10, 5)}
-    extra = rows + [{"decree_number": "X1", "decree_date": D(2026, 9, 5), "decree_type": "نفقة دولة", "decree_value": 125000.0}]
-    mm = match_bmt_decrees([a2, a1], extra)
-    assert mm[1]["first"]["decree_number"] == "202640051000" and mm[2]["first"]["decree_number"] == "X1", mm
-    assert mm[1]["second"] is None and mm[2]["second"]["decree_number"] == "202641071969"
-    #     a non-state-fund decree is ignored
-    other = [dict(rows[2], decree_type="تأمين صحي")]
-    assert match_bmt_decrees([st], other)[1]["first"] is None
+    a2 = {"admission_id": 2, "check_in_date": D(2026, 12, 1), "check_out_date": D(2027, 1, 5)}
+    two = [mk("F1", D(2026, 6, 1), 125000.0, T1), mk("S1", D(2026, 7, 3), 100000.0, T2), mk("F2", D(2026, 11, 20), 125000.0, T1), mk("S2", D(2026, 12, 2), 100000.0, T2)]
+    mm = match_bmt_decrees([a2, a1], two)
+    assert (mm[1]["first"]["decree_number"], mm[1]["second"]["decree_number"], mm[2]["first"]["decree_number"], mm[2]["second"]["decree_number"]) == ("F1", "S1", "F2", "S2"), mm
+    #     pinned decrees are kept and never re-matched
+    pn = match_bmt_decrees([st], two, pinned={1: {"first": mk("F2", D(2026, 11, 20), 125000.0, T1)}})[1]
+    assert pn["first"]["decree_number"] == "F2" and pn["second"]["decree_number"] == "S1", pn
+    #     pages are read for every unread state-fund decree >= the floor, whatever its date
+    unread = [mk("U1", D(2025, 1, 1), 125000.0), mk("U2", D(2026, 5, 1), 3500.0), mk("U3", D(2026, 5, 31), 100000.0)]
+    assert [d["decree_number"] for d in decrees_to_read([st], unread, match_bmt_decrees([st], unread))] == ["U1", "U3"]
+    rows = [mk("202640051000", D(2026, 7, 4), 125000.0)]
     # --- evaluation
     d1 = {"decree_number": "202640051000", "decree_date": D(2026, 7, 4), "decree_value": 125000.0, "procedure_text": "لزرع نخاع ذاتي (قرار اول)"}
     d2 = {"decree_number": "202641071969", "decree_date": D(2026, 9, 7), "decree_value": 100000.0, "procedure_text": "لزرع نخاع ذاتي (قرار ثاني)"}
@@ -1087,25 +1131,13 @@ def _selftest():
     d5k = {"decree_number": "C5", "decree_date": D(2026, 7, 6), "decree_type": "نفقة دولة", "decree_value": 5000.0, "procedure_text": "زرع نخاع"}
     dcr = lambda x: dict(x)
     st2 = {"admission_id": 7, "check_in_date": D(2026, 7, 20), "check_out_date": D(2026, 8, 15)}
-    base_found = [dcr(d100), dcr(d70x)]
-    assert match_bmt_decrees([st2], base_found)[7]["first"] is None                       # regular pass: nothing for the 125,000 slot
-    todo = decrees_to_read([st2], [dict(d100), dict(d70x, procedure_text=None)], match_bmt_decrees([st2], base_found))
-    assert [d["decree_number"] for d in todo] == ["B70"], todo                             # only the unread non-regular decree is read
-    mm = match_bmt_decrees([st2], [dcr(d100), dcr(d70), dcr(d70x), dcr(d5k)], use_description=True)[7]
-    assert mm["first"]["decree_number"] == "A70" and mm["first"]["source"] == "description", mm   # 'chemo' 70k and the 5,000 are ignored
-    assert mm["second"]["decree_number"] == "A100" and mm["second"]["source"] == "value"
-    assert any("matched by its description" in n for n in mm["notes"]) and not any("125,000 decree rejected" in n or "no decree of value 125,000" in n for n in mm["notes"]), mm["notes"]
-    assert match_bmt_decrees([st2], [dcr(d100), dcr(d70x)], use_description=True)[7]["first"] is None   # text without "نخاع" -> not taken
-    # a regular 125,000 decree always wins over the description
-    d125 = {"decree_number": "A125", "decree_date": D(2026, 7, 1), "decree_type": "نفقة دولة", "decree_value": 125000.0}
-    assert match_bmt_decrees([st2], [d125, dcr(d100), dcr(d70)], use_description=True)[7]["first"]["decree_number"] == "A125"
     # --- v2: evaluation with a 70,000 decree -> exception, tracked, not accrued
     dd1 = dict(d70, source="description")
     dd2 = dict(d100, procedure_text="لزرع نخاع ذاتي (قرار ثاني)", source="value")
     rc2 = lambda i, on, v: {"receipt_id": i, "registered_on": on, "value": v, "counted": True}
     ev = evaluate_bmt(st2, {"first": dd1, "second": dd2},
                       {"A70": [rc2("1", D(2026, 8, 20), 70000.0)], "A100": [rc2("2", D(2026, 8, 22), 60000.0), rc2("3", D(2026, 8, 25), 40000.0)]}, D(2026, 9, 1))
-    assert ev["decrees_count"] == 2 and ev["decrees_total"] == 170000.0 and ev["is_exception"] and ev["accrual_value"] == 0.0, ev
+    assert ev["decrees_count"] == 2 and ev["decrees_total"] == 170000.0 and ev["is_exception"] and ev["accrual_value"] == 170000.0, ev
     assert ev["dec1_source"] == "description" and ev["dec2_source"] == "value" and ev["status"] == "closed"
     assert ev["dec1_remaining"] == 0 and ev["dec2_receipts_n"] == 2 and ev["dec2_first_receipt_on"] == D(2026, 8, 22) and ev["dec2_last_receipt_on"] == D(2026, 8, 25)
     assert ev["dec1_days_to_bill"] == 5 and ev["dec2_days_to_bill"] == 10 and ev["billed_on"] == D(2026, 8, 25)
@@ -1128,26 +1160,42 @@ def _selftest():
             5: {"admission_id": 5, "check_out_date": D(2026, 9, 1), "financial_category_id": None}}     # category cleared; 6 deleted
     vd = reconcile_tracking(tracked, live, D(2026, 7, 1))
     assert vd[1] is None and "category" in vd[2] and "discharged" in vd[3] and "before the tracking start" in vd[4] and "category" in vd[5] and "no longer found" in vd[6], vd
-    # --- v2: money ledger. 3 standard patients + 1 exception (ignored)
-    rows_l = [{"admission_id": 1, "check_out_date": D(2026, 7, 10), "accrual_value": 225000.0},
-              {"admission_id": 2, "check_out_date": D(2026, 7, 20), "accrual_value": 225000.0},
-              {"admission_id": 3, "check_out_date": D(2026, 8, 5), "accrual_value": 225000.0},
-              {"admission_id": 4, "check_out_date": D(2026, 8, 6), "accrual_value": 0.0}]
-    rl = lambda a, i, on, v, c=True: {"admission_id": a, "receipt_id": i, "registered_on": on, "value": v, "counted": c}
-    recs_l = [rl(1, "a", D(2026, 7, 15), 125000.0), rl(1, "b", D(2026, 8, 2), 100000.0),     # patient 1: 125k in July, 100k in August
-              rl(2, "c", D(2026, 8, 3), 100000.0), rl(2, "d", D(2026, 8, 4), 999.0, False),  # rejected receipt ignored
-              rl(3, "e", D(2026, 8, 9), 300000.0),                                            # over-billing is capped at the accrual
-              rl(4, "f", D(2026, 8, 9), 70000.0)]
-    lg = {m["month"]: m for m in value_ledger(rows_l, recs_l, D(2026, 9, 10))}
+    # --- v3: money ledger on the REAL decree total
+    D1 = lambda n, v, d: {f"dec1_number": n, "dec1_value": v, "dec1_date": d}
+    r1 = dict(admission_id=1, check_out_date=D(2026, 7, 10), dec1_number="A1", dec1_value=125000.0, dec1_date=D(2026, 5, 1),
+              dec2_number="A2", dec2_value=100000.0, dec2_date=D(2026, 7, 12))                       # standard, both issued
+    r2 = dict(admission_id=2, check_out_date=D(2026, 7, 20), dec1_number="B1", dec1_value=80000.0, dec1_date=D(2026, 6, 1),
+              dec2_number=None, dec2_value=None, dec2_date=None)                                      # ONE decree: 80,000 + nominal 100,000 = 180,000
+    r3 = dict(admission_id=3, check_out_date=D(2026, 8, 5), dec1_number="C1", dec1_value=125000.0, dec1_date=D(2026, 6, 1),
+              dec2_number=None, dec2_value=None, dec2_date=None)                                      # ONE decree: 125,000 + nominal 100,000 = 225,000
+    r4 = dict(admission_id=4, check_out_date=D(2026, 8, 6), is_exception=True, dec1_number="E1", dec1_value=75000.0, dec1_date=D(2026, 6, 1),
+              dec2_number="E2", dec2_value=100000.0, dec2_date=D(2026, 8, 1))                         # exception, real total 175,000
+    rl = lambda a, dn, i, on, v, c=True: {"admission_id": a, "decree_number": dn, "receipt_id": i, "registered_on": on, "value": v, "counted": c}
+    recs_l = [rl(1, "A1", "a", D(2026, 7, 15), 125000.0), rl(1, "A2", "b", D(2026, 8, 2), 100000.0),   # patient 1: closed in August
+              rl(2, "B1", "c", D(2026, 8, 3), 60000.0), rl(2, "B1", "d", D(2026, 8, 4), 999.0, False),  # rejected ignored
+              rl(3, "C1", "e", D(2026, 8, 9), 130000.0),                                            # over-billing capped at THAT decree (125,000)
+              rl(4, "E1", "f", D(2026, 8, 9), 75000.0)]
+    lg = {m["month"]: m for m in value_ledger([r1, r2, r3, r4], recs_l, D(2026, 9, 10))}
     assert list(lg) == ["2026-07", "2026-08", "2026-09"]
-    assert (lg["2026-07"]["opening_value"], lg["2026-07"]["new_value"], lg["2026-07"]["billed_value"], lg["2026-07"]["closing_value"]) == (0, 450000, 125000, 325000), lg["2026-07"]
+    j = lg["2026-07"]
+    assert (j["opening_value"], j["new_value"], j["billed_value"], j["closing_value"]) == (0, 405000, 125000, 280000), j
+    assert j["closing_n"] == 2 and j["closed_n"] == 0
     a8 = lg["2026-08"]
-    assert a8["opening_value"] == 325000 and a8["new_value"] == 225000 and a8["billed_value"] == 100000 + 100000 + 225000
-    assert a8["billed_from_this_month"] == 225000 and a8["billed_from_previous_months"] == 200000 and a8["billed_by_origin"] == {"2026-07": 200000, "2026-08": 225000}, a8
-    assert a8["closing_value"] == 325000 + 225000 - 425000 == 125000 and lg["2026-09"]["opening_value"] == 125000 and lg["2026-09"]["closing_value"] == 125000
+    assert a8["opening_value"] == 280000 and a8["new_value"] == 225000 + 175000
+    assert a8["billed_value"] == 100000 + 60000 + 125000 + 75000 == 360000, a8
+    assert a8["billed_by_origin"] == {"2026-07": 160000, "2026-08": 200000}, a8
+    assert a8["closing_value"] == 280000 + 400000 - 360000 == 320000
+    # open at end of Aug: p2 (120,000 left: 20,000 on the issued 80k decree + 100,000 nominal), p3 (100,000 nominal), p4 (100,000 on E2)
+    assert a8["closing_n"] == 3 and a8["closed_n"] == 1                                              # p1 closed in August
+    assert a8["closing_pending"] == 100000 + 100000 and a8["closing_issued"] == 20000 + 100000, a8
+    assert a8["closing_by_origin"] == {"2026-07": (1, 120000.0), "2026-08": (2, 200000.0)}, a8
+    assert lg["2026-09"]["closing_value"] == 320000
     # manual close bills the rest on the closing day
-    lg2 = value_ledger([dict(rows_l[1], closed_on=D(2026, 9, 2))], [rl(2, "c", D(2026, 8, 3), 100000.0)], D(2026, 9, 10))
-    assert lg2[-1]["closing_value"] == 0 and lg2[-1]["billed_value"] == 125000
+    lg2 = value_ledger([dict(r2, closed_on=D(2026, 9, 2))], [rl(2, "B1", "c", D(2026, 8, 3), 60000.0)], D(2026, 9, 10))
+    assert lg2[-1]["closing_value"] == 0 and lg2[-1]["billed_value"] == 120000
+    # legacy lump rows still work
+    lg3 = value_ledger([{"admission_id": 9, "check_out_date": D(2026, 8, 1), "accrual_value": 225000.0}], [rl(9, None, "z", D(2026, 8, 9), 50000.0)], D(2026, 8, 20))
+    assert lg3[-1]["closing_value"] == 175000
     # --- v2: timing statistics
     tr = [dict(ev, check_out_date=st["check_out_date"]), dict(ev2, check_out_date=st["check_out_date"])]
     ts = timing_stats(tr, D(2026, 10, 30))
