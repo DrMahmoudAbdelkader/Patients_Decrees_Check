@@ -96,6 +96,10 @@ REQUEST_LOOKBACK_DAYS = int(os.environ.get("REQUEST_LOOKBACK_DAYS", "7"))   # li
 MAX_DETAILS_PER_RUN = int(os.environ.get("MAX_DETAILS_PER_RUN", "400"))
 REQUEST_DELAY = 0.3
 EPS = 0.005   # money comparison slack (float noise only; there is NO billing tolerance)
+# A decree's value/date can change on SMC after it was first read (value raised, re-issued). Re-read the decree page of
+# every stay that is re-checked, so the cached value never goes stale. ICU_REREAD_DECREES=0 restores the old read-once behaviour.
+REREAD_DECREE_PAGES = os.environ.get("ICU_REREAD_DECREES", "1") != "0"
+_VL_WARNED: List[str] = []     # decrees whose page showed no value-left (first 3 are logged with the page text)
 
 # ---- (b) run statistics -------------------------------------------------
 # Counters for the end-of-run report (what was read, what failed). Reset at the start of run().
@@ -325,12 +329,28 @@ def evaluate_stay(stay: dict, requests: List[dict], decrees: Dict[str, dict],
         alloc = min(value, max(0.0, bill_total - covered)) if bill_total else 0.0
         covered += alloc
         recs = receipts_by_decree.get(dnum, [])
-        billed_total += sum(float(x.get("value") or 0) for x in recs if x.get("counted", True))
+        left = d.get("value_left")
+        if left is not None:
+            # SMC's own balance is the truth: billed = decree value - value left (receipt statuses do not matter)
+            consumed = max(0.0, min(value, value - float(left)))
+            billed_d = min(consumed, alloc) if bill_total else consumed
+            billed_total += billed_d
+        else:                       # value left not readable: fall back to the receipts SMC listed as accepted
+            billed_d = None
+            billed_total += sum(float(x.get("value") or 0) for x in recs if x.get("counted", True))
         if alloc > EPS:
-            done_on, billed_sofar = _billing_progress(recs, alloc)
             note = ""
-            if done_on is None:
-                note = f"billed {billed_sofar:g} of {alloc:g}" if billed_sofar > EPS else "nothing billed yet"
+            if billed_d is not None:
+                if billed_d >= alloc - EPS:
+                    dated = [x["registered_on"] for x in recs if x.get("registered_on")]
+                    done_on = max(dated) if dated else d["decree_date"]
+                else:
+                    done_on = None
+                    note = f"billed {billed_d:g} of {alloc:g}" if billed_d > EPS else "nothing billed yet"
+            else:
+                done_on, billed_sofar = _billing_progress(recs, alloc)
+                if done_on is None:
+                    note = f"billed {billed_sofar:g} of {alloc:g}" if billed_sofar > EPS else "nothing billed yet"
             ob = _ob("bill_under_decree", dnum, add_work_days(d["decree_date"], BILL_UNDER_DECREE_DAYS), done_on, note)
             obligations.append(ob)
             billing_obs.append(ob)
@@ -385,6 +405,38 @@ def evaluate_stay(stay: dict, requests: List[dict], decrees: Dict[str, dict],
         "requests_count": len(chain), "smc_summary": summary,
         "obligations": obligations, "notes": notes,
     }
+
+
+def merge_decree_info(d: Optional[dict], info: dict, dnum: str, adm: int, rnum: str) -> Tuple[dict, Optional[str]]:
+    """Combine a freshly read decree page with the cached decree row.
+    -> (decree row, description of what changed or None).  A value the page could not give (None) never
+    overwrites a known one.  A brand-new decree returns the change text 'new'."""
+    if not d or not d.get("decree_date") or d.get("decree_value") is None:
+        return ({"decree_number": dnum, "admission_id": adm, "request_number": rnum,
+                 "decree_date": info.get("decree_date"), "decree_value": info.get("decree_value"),
+                 "procedure_text": info.get("procedure_text"), "details_checked_at": now_iso(),
+                 "value_left": info.get("value_left"), "value_left_checked_at": now_iso() if info.get("value_left") is not None else None,
+                 "receipts_total": (d or {}).get("receipts_total", 0), "receipts_count": (d or {}).get("receipts_count", 0),
+                 "receipts_checked_at": (d or {}).get("receipts_checked_at")}, "new")
+    changes = []
+    new_val = info.get("decree_value")
+    if new_val is not None and abs(float(new_val) - float(d.get("decree_value") or 0)) > EPS:
+        changes.append(f"value {float(d.get('decree_value') or 0):g} -> {float(new_val):g}")
+        d["decree_value"] = float(new_val)
+    if info.get("decree_date") and info["decree_date"] != d.get("decree_date"):
+        changes.append(f"date {d.get('decree_date')} -> {info['decree_date']}")
+        d["decree_date"] = info["decree_date"]
+    if info.get("procedure_text") and info["procedure_text"] != d.get("procedure_text"):
+        d["procedure_text"] = info["procedure_text"]
+        changes.append("procedure text")
+    if info.get("value_left") is not None:
+        old_left = d.get("value_left")
+        if old_left is None or abs(float(old_left) - float(info["value_left"])) > EPS:
+            changes.append(f"value left {'?' if old_left is None else format(float(old_left), 'g')} -> {float(info['value_left']):g}")
+            d["value_left"] = float(info["value_left"])
+        d["value_left_checked_at"] = now_iso()
+    d["details_checked_at"] = now_iso()
+    return d, ("; ".join(changes) or None)
 
 
 def compute_breaches(obligations: List[dict], today: date) -> List[dict]:
@@ -564,25 +616,91 @@ def parse_request_details(html: str) -> dict:
     return out
 
 
+# "value left" of a decree as SMC shows it on the decree page.
+# The decree page (DecreeTreatmentProcedure/Create/<decree>) has TWO tables:
+#   #decreeTable               header: "قيمة القرار: 4000" (decree total), date, patient, procedure ...
+#   #decreeTreatmentProcTable  footer row: قيمة القرار | 4000 | إجمالي تكلفة الإجراءات العلاجية | <td id="TotalCost">4000.00</td>
+#                                          | المتبقي | <td id="Remaining">0.00</td>
+# "المتبقي" (value left) lives ONLY in the second table's <tfoot> - 0.00 means the decree is fully consumed.
+_NUM = r"(-?[\d,]+(?:\.\d+)?)"
+_VALUE_LEFT_RE = re.compile(
+    r"(?:القيم[ةه]\s+)?(?:المتبقي[ةه]?|المتبقى|الرصيد\s+المتبقي|الباقي)(?:\s+من\s+القرار)?\s*:?\s*" + _NUM)
+_VALUE_TOTAL_RE = re.compile(r"قيمة القرار\s*:?\s*" + _NUM)
+
+
+def parse_value_left(txt: str) -> Optional[float]:
+    m = _VALUE_LEFT_RE.search(txt or "")
+    return to_float(m.group(1)) if m else None
+
+
+def _cell_float(el) -> Optional[float]:
+    return to_float(re.sub(r"\s+", " ", el.get_text(" ", strip=True))) if el is not None else None
+
+
+def _footer_value_after(tfoot, label: str) -> Optional[float]:
+    """Number in the cell right after the footer cell whose text is `label` (e.g. 'المتبقي')."""
+    if tfoot is None:
+        return None
+    for td in tfoot.find_all(["td", "th"]):
+        if ar2en(td.get_text(" ", strip=True)).strip(" :") == label:
+            nxt = td.find_next_sibling(["td", "th"])
+            v = _cell_float(nxt)
+            if v is not None:
+                return v
+    return None
+
+
 def parse_decree_page(html: str) -> Optional[dict]:
     soup = BeautifulSoup(html or "", "html.parser")
     table = soup.find("table", {"id": "decreeTable"})
-    if not table:
+    proc_table = soup.find("table", {"id": "decreeTreatmentProcTable"})
+    if not table and not proc_table:
         return None
-    txt = ar2en(re.sub(r"\s+", " ", table.get_text(" ", strip=True)))
-    out = {"decree_date": None, "decree_value": None, "procedure_text": None}
+    txt = ar2en(re.sub(r"\s+", " ", table.get_text(" ", strip=True))) if table else ""
+    out = {"decree_date": None, "decree_value": None, "procedure_text": None, "value_left": None}
     m = re.search(r"تاريخ القرار:\s*(\d{1,2})-(\d{1,2})-(\d{4})", txt)
     if m:
         try:
             out["decree_date"] = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
         except ValueError:
             pass
-    m = re.search(r"قيمة القرار:\s*([\d,]+(?:\.\d+)?)", txt)
+
+    # ---- decree total value: header table -> hidden input -> footer of the procedures table
+    m = _VALUE_TOTAL_RE.search(txt)
     if m:
         out["decree_value"] = to_float(m.group(1))
+    if out["decree_value"] is None:
+        hid = soup.find("input", {"id": "DecreeTotalCost"})
+        if hid is not None:
+            out["decree_value"] = to_float(hid.get("value"))
+    tfoot = proc_table.find("tfoot") if proc_table else None
+    if out["decree_value"] is None:
+        out["decree_value"] = _footer_value_after(tfoot, "قيمة القرار")
+
     m = re.search(r"الإجراء:\s*(.*?)(?:\s+هذه الحالة|$)", txt)
     if m:
         out["procedure_text"] = m.group(1).strip() or None
+
+    # ---- value left ("المتبقي"): <td id="Remaining"> -> cell after the label in the footer -> text regex
+    left = _cell_float(soup.find(id="Remaining"))
+    if left is None:
+        left = _footer_value_after(tfoot, "المتبقي")
+    if left is None and tfoot is not None:
+        left = parse_value_left(ar2en(re.sub(r"\s+", " ", tfoot.get_text(" ", strip=True))))
+    if left is None:
+        left = parse_value_left(txt)
+    out["value_left"] = left
+
+    # sanity: a balance can never be negative or bigger than the decree itself
+    v = out["decree_value"]
+    if left is not None:
+        if left < 0:
+            out["value_left"] = 0.0
+        elif v is not None and left > v + 0.01:
+            out["value_left"] = v
+
+    foot_txt = ar2en(re.sub(r"\s+", " ", tfoot.get_text(" ", strip=True))) if tfoot else ""
+    out["table_text"] = (txt[:400] + " || FOOTER: " + foot_txt[:300])      # only used to diagnose an unrecognised label
     return out
 
 
@@ -892,6 +1010,15 @@ def run():
         log.warning("icu_stay_requests.facility column missing - run icu_stay_requests_facility.sql "
                     "(facility is re-read from SMC every run until then)")
 
+    # decree "value left" is new: run icu_stay_decrees_value_left.sql once; until then it is still used in memory every run
+    try:
+        sb.fetch_all(DECREES_TABLE, "value_left", "limit=1")
+        value_left_col = True
+    except Exception:
+        value_left_col = False
+        log.warning("icu_stay_decrees.value_left column missing - run icu_stay_decrees_value_left.sql "
+                    "(value left is read from SMC every run meanwhile, just not stored)")
+
     # in-memory fact tables (db rows normalised to python types)
     def norm_req(r):
         r = dict(r)
@@ -1081,24 +1208,40 @@ def run():
             log.info(f"[decree portal] login OK (SMC_USERNAME) - reading {len(wanted)} issued decree(s) + their receipts")
             for adm, dnum, rnum in wanted:
                 d = decs.get(dnum)
-                if not d or not d.get("decree_date") or d.get("decree_value") is None:
+                incomplete = not d or not d.get("decree_date") or d.get("decree_value") is None
+                if incomplete or REREAD_DECREE_PAGES:
                     STATS["decree_pages"] += 1
                     info = fetch_decree(sess_b, dnum)
                     time.sleep(REQUEST_DELAY)
                     if not info or not info["decree_date"]:
-                        stay_errors[adm].append(f"decree {dnum} page not readable")
-                        continue
-                    d = {"decree_number": dnum, "admission_id": adm, "request_number": rnum,
-                         "decree_date": info["decree_date"], "decree_value": info["decree_value"],
-                         "procedure_text": info["procedure_text"], "details_checked_at": now_iso(),
-                         "receipts_total": 0, "receipts_count": 0, "receipts_checked_at": None}
-                    decs[dnum] = d; dec_dirty.add(dnum)
+                        if incomplete:
+                            stay_errors[adm].append(f"decree {dnum} page not readable")
+                            continue
+                        log.warning(f"decree {dnum} page not readable this run - keeping the stored value {d.get('decree_value')}")
+                    else:
+                        d, what = merge_decree_info(d, info, dnum, adm, rnum)
+                        decs[dnum] = d
+                        if info.get("value_left") is None and len(_VL_WARNED) < 3:
+                            _VL_WARNED.append(dnum)
+                            log.warning(f"[value left] not found on the page of decree {dnum} - receipts are used instead. "
+                                        f"Decree table text: {info.get('table_text')!r}")
+                        if what:
+                            dec_dirty.add(dnum)
+                            if what != "new":
+                                log.info(f"[decree changed on SMC] {dnum} (#{adm}): {what}")
                 STATS["receipt_lists"] += 1
                 got = fetch_receipts(sess_b, dnum)
                 time.sleep(REQUEST_DELAY)
                 if got is None:
                     stay_errors[adm].append(f"receipts of decree {dnum} not readable")
                     continue
+                odd = [x for x in got if not x.get("counted", True) or not float(x.get("value") or 0)]
+                if odd:       # receipts that exist on SMC but add NOTHING to "billed": show exactly why
+                    log.warning(f"[receipts] decree {dnum} (#{adm}): {len(got)} receipt(s), {len(odd)} not counted or zero: " + "; ".join(
+                        f"{x['receipt_id']} value={x.get('value')} code={x.get('status_code')!r} text={x.get('status_text')!r} counted={x.get('counted')}"
+                        for x in odd[:6]))
+                elif not got:
+                    log.info(f"[receipts] decree {dnum} (#{adm}): SMC returned no receipt table")
                 for rc in got:
                     old = recs.get(rc["receipt_id"])
                     rc["admission_id"] = adm
@@ -1190,7 +1333,8 @@ def run():
                 "letter_date", "letter_text", "letter_checked", "last_checked_at"]
     upsert_uniform(REQUESTS_TABLE, [{k: reqs[n].get(k) for k in req_cols} for n in req_dirty], "request_number")
     dec_cols = ["decree_number", "admission_id", "request_number", "decree_date", "decree_value", "procedure_text",
-                "details_checked_at", "receipts_total", "receipts_count", "receipts_checked_at"]
+                "details_checked_at", "receipts_total", "receipts_count", "receipts_checked_at"] \
+        + (["value_left", "value_left_checked_at"] if value_left_col else [])
     upsert_uniform(DECREES_TABLE, [{k: decs[n].get(k) for k in dec_cols} for n in dec_dirty], "decree_number")
     rec_cols = ["receipt_id", "decree_number", "admission_id", "registered_on", "registered_at_local", "value",
                 "status_code", "status_text", "counted"]
@@ -1447,6 +1591,52 @@ def _selftest_full():
     assert status_bucket("قرار نهائى") == "final" and status_bucket("قرار نهائي") == "final"
     assert status_bucket("خطاب ادارى") == "admin_letter" and status_bucket("خطاب إداري") == "admin_letter"
     assert status_bucket("إلغاء الطلب") == "cancelled" and status_bucket("لجنة طبية") == "pending"
+    # 10) a decree whose value is raised on SMC after it was first read must be picked up
+    cached = {"decree_number": "D1", "admission_id": 1, "request_number": "r", "decree_date": D(2026, 8, 20),
+              "decree_value": 16000.0, "procedure_text": "x", "receipts_total": 12000.0, "receipts_count": 2}
+    row, what = merge_decree_info(dict(cached), {"decree_date": D(2026, 8, 20), "decree_value": 20000.0, "procedure_text": "x"}, "D1", 1, "r")
+    assert row["decree_value"] == 20000.0 and "16000 -> 20000" in what and row["receipts_total"] == 12000.0, (row, what)
+    row, what = merge_decree_info(dict(cached), {"decree_date": D(2026, 8, 20), "decree_value": 16000.0, "procedure_text": "x"}, "D1", 1, "r")
+    assert what is None and row["decree_value"] == 16000.0
+    row, what = merge_decree_info(dict(cached), {"decree_date": D(2026, 8, 20), "decree_value": None, "procedure_text": None}, "D1", 1, "r")
+    assert what is None and row["decree_value"] == 16000.0          # an unreadable value never wipes a known one
+    row, what = merge_decree_info(None, {"decree_date": D(2026, 8, 20), "decree_value": 4000.0, "procedure_text": "x"}, "D2", 1, "r")
+    assert what == "new" and row["decree_value"] == 4000.0
+    # the raised decree now covers the whole bill: 20000 >= 18551.40 -> nothing left to continue
+    ev = evaluate_stay({"check_out_date": D(2026, 8, 13), "bill_total": 18551.4, "bill_created_on": D(2026, 8, 14)},
+                       [{"request_number": "1", "request_date": D(2026, 8, 14), "status_bucket": "final", "decree_number": "D1"}],
+                       {"D1": dict(row_ := {"decree_number": "D1", "decree_date": D(2026, 8, 20), "decree_value": 20000.0})},
+                       {"D1": [{"receipt_id": "9", "registered_on": D(2026, 8, 22), "value": 18551.4, "counted": True}]}, D(2026, 10, 31))
+    assert ev["remaining_to_cover"] == 0 and ev["status"] == "closed", ev
+    # 11) value left is the truth: billed = decree value - value left, receipt statuses are irrelevant
+    mk = lambda val, left, bill: evaluate_stay(
+        {"check_out_date": D(2026, 7, 9), "bill_total": bill, "bill_created_on": D(2026, 7, 10)},
+        [{"request_number": "1", "request_date": D(2026, 7, 10), "status_bucket": "final", "decree_number": "D"}],
+        {"D": {"decree_number": "D", "decree_date": D(2026, 7, 20), "decree_value": val, "value_left": left}},
+        {"D": [{"receipt_id": "1", "registered_on": D(2026, 7, 22), "value": val, "counted": False}]}, D(2026, 10, 31))
+    ev = mk(10000.0, 0.0, 10207.37)             # patient 1: only receipt rejected (R00) but the decree is fully consumed
+    assert ev["billed_value"] == 10000.0 and ev["covered_value"] == 10000.0 and ev["remaining_to_cover"] == 207.37, ev
+    assert not [o for o in ev["obligations"] if o["stage"] == "bill_under_decree" and not o["done"]], ev
+    ev = mk(16000.0, 4000.0, 18551.4)           # 12000 billed, 4000 still to bill under the decree
+    assert ev["billed_value"] == 12000.0 and any(o["stage"] == "bill_under_decree" and not o["done"] for o in ev["obligations"]), ev
+    ev = mk(20000.0, 1448.6, 18551.4)           # raised decree, whole bill billed; the unused rest of the decree is not "billed"
+    assert ev["billed_value"] == 18551.4 and ev["status"] == "closed", ev
+    ev = mk(10000.0, None, 10000.0)             # value left unreadable -> falls back to counted receipts (none counted)
+    assert ev["billed_value"] == 0.0, ev
+    assert parse_value_left("قيمة القرار: 16,000 القيمة المتبقية: 4,000.50") == 4000.5
+    assert parse_value_left("المتبقي من القرار : 0") == 0.0 and parse_value_left("قيمة القرار: 5 الباقي 1,200") == 1200.0
+    assert parse_value_left("قيمة القرار: 16,000") is None
+    _pg = ('<table id="decreeTable"><tr><th>رقم القرار:</th><td>202641118876<input type="hidden" id="DecreeTotalCost" value="4000"></td>'
+           '<th>تاريخ القرار:</th><td>11-09-2026</td></tr><tr><td>قيمة القرار:</td><td>4000</td>'
+           '<th>الإجراء:</th><td>رعايه مركزه</td></tr></table>'
+           '<table id="decreeTreatmentProcTable"><tbody id="decreeTreatmentProcBody"></tbody><tfoot><tr><td>قيمة القرار</td><td>4000</td>'
+           '<td>إجمالي تكلفة الإجراءات العلاجية</td><td id="TotalCost">4000.00</td><td>المتبقي</td><td id="Remaining">0.00</td></tr></tfoot></table>')
+    _i = parse_decree_page(_pg)
+    assert _i["decree_value"] == 4000.0 and _i["value_left"] == 0.0 and _i["decree_date"] == date(2026, 9, 11), _i
+    _i = parse_decree_page(_pg.replace('id="Remaining">0.00', 'id="Remaining">1,250.50'))
+    assert _i["value_left"] == 1250.5, _i
+    _i = parse_decree_page(_pg.replace(' id="Remaining"', ''))           # no id -> falls back to the cell after the label
+    assert _i["value_left"] == 0.0, _i
     return True
 
 
