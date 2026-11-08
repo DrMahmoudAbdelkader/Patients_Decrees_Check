@@ -65,8 +65,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-import queue_extractor as qx
-import queue_parser as qp  # kept for outpat_clnc_lst_det_sts_j, currently unused (see revert note above)
+import queue_store  # queue now comes from the private relay (R2), not HMIS directly
 import smc_session as smc
 import supabase_client as sb
 from decree_name_map import normalize_decree_name, normalize_item_name, get_decree_map, get_item_map
@@ -90,29 +89,12 @@ DELAY_BETWEEN_DECREES = 0.3
 # STEP 1 — Queue
 # =====================================================================
 def fetch_and_parse_queue(date_ddmmyyyy: str) -> list:
-    """Downloads + parses the queue report for a single day. Returns
-    clean record dicts shaped by queue_extractor.parse_clinic_report():
-    Date, Day, Clinic, Resource ID, Resource Name, Doctor ID, Doctor
-    Name, Medical No., Time, Slots, Patient Name, Financial Cat. Code,
-    Financial Category, Sex, Birth Date. Note: Medical No. here is the
-    INTERNAL HMIS id (his_mr), not the national ID -- see
-    build_queue_rows()."""
-    date_slash = date_ddmmyyyy.replace('-', '/')
-    session = qx.requests.Session()
-
-    logging.info(f"Downloading queue report for {date_ddmmyyyy} (report={qx.REPORT_CODE})...")
-    filename, content = qx.fetch_report(session, qx.REPORT_CODE, date_slash, date_slash)
-
-    logging.info("Verifying server used the requested date range...")
-    qx.verify_report_date_range(content, date_slash, date_slash)
-
-    logging.info("Parsing raw report into clean rows...")
-    records, warnings = qx.parse_clinic_report(content)
-    if warnings:
-        for w in warnings:
-            logging.warning(f"[queue parse] {w}")
-    logging.info(f"Parsed {len(records)} raw queue rows.")
-    return records
+    """Reads the day's queue from the private relay/R2 store (filled by the
+    app's 'Download queue' button). Same record shape the old HMIS report
+    parser produced (Clinic, Medical No., Time, ...). Raises
+    queue_store.QueueNotReady if that day hasn't been downloaded yet."""
+    date_iso = datetime.strptime(date_ddmmyyyy, "%d-%m-%Y").strftime("%Y-%m-%d")
+    return queue_store.load_queue_records(date_iso)
 
 
 def build_queue_rows(raw_records: list, appointment_date_iso: str,
@@ -162,7 +144,17 @@ def build_queue_rows(raw_records: list, appointment_date_iso: str,
         filtered.append((clinic, medical_no, rec))
         medical_numbers.add(medical_no)
 
-    national_id_by_mr = resolver.resolve(sorted(medical_numbers))
+    # If the relay's records already carry a national ID, use it and only
+    # fall back to the HMIS lookup for rows that don't.
+    direct_ids = {}
+    for _c, _m, _rec in filtered:
+        _nid = str(_rec.get("National ID") or "").strip()
+        if _nid:
+            direct_ids[_m] = _nid
+    to_resolve = sorted(medical_numbers - set(direct_ids))
+    national_id_by_mr = dict(direct_ids)
+    if to_resolve:
+        national_id_by_mr.update(resolver.resolve(to_resolve))
     unresolved = medical_numbers - set(national_id_by_mr)
     if unresolved:
         logging.warning(
